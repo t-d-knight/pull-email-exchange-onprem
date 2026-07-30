@@ -67,6 +67,13 @@ $LargeImpactMailboxThreshold = 10
 # straight to the console).
 $PreviewDisplayLimit = 20
 
+# On-prem compliance search / Search-Mailbox have no "messageid" KQL property
+# (that field is Exchange Online-only) - a -MessageID search is resolved via
+# message tracking logs first (see Resolve-MessageIdToCriteria). These control
+# how far back to look, and how wide a date window to build around the result.
+$MessageTrackingLookbackDays = 30
+$MessageIdDateWindowHours = 12
+
 
 function Connect-ExchangeSession {
     param(
@@ -90,9 +97,12 @@ function Connect-ExchangeSession {
     $connectionUri = "${scheme}://$Server/PowerShell/"
 
     Write-Host "Connecting to $connectionUri as $($Credential.UserName) ..." -ForegroundColor Cyan
-    $session = New-PSSession -ConfigurationName Microsoft.Exchange -ConnectionUri $connectionUri -Authentication Kerberos -Credential $Credential -ErrorAction Stop
+    # -Verbose:$false overrides the script-wide $VerbosePreference = 'Continue' - without it,
+    # Import-PSSession dumps an Exporting/Importing line for every one of the ~800 proxied
+    # Exchange cmdlets, burying everything useful underneath it.
+    $session = New-PSSession -ConfigurationName Microsoft.Exchange -ConnectionUri $connectionUri -Authentication Kerberos -Credential $Credential -ErrorAction Stop -Verbose:$false
 
-    Import-PSSession $session -DisableNameChecking -AllowClobber -ErrorAction Stop | Out-Null
+    Import-PSSession $session -DisableNameChecking -AllowClobber -ErrorAction Stop -Verbose:$false | Out-Null
 
     try {
         $null = Get-OrganizationConfig -ErrorAction Stop
@@ -233,6 +243,64 @@ function Get-SearchCriteriaInteractive {
     }
 
     return $result
+}
+
+
+function Resolve-MessageIdToCriteria {
+    param(
+        [string]$MessageID
+    )
+
+    Write-Host "`nOn-premises Exchange has no 'messageid' KQL property (that field is Exchange Online-only) - resolving this Message-ID via message tracking logs first..." -ForegroundColor Yellow
+
+    $servers = @(Get-TransportService -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name)
+    if (-not $servers) {
+        # Fallback for older builds (pre-2013) where Get-TransportService doesn't exist.
+        $servers = @(Get-TransportServer -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name)
+    }
+    if (-not $servers) {
+        Write-Error "Could not enumerate any transport servers to search message tracking logs on."
+    }
+
+    $startDate = (Get-Date).AddDays(-$MessageTrackingLookbackDays)
+    $entries = @()
+    foreach ($srv in $servers) {
+        try {
+            $entries += Get-MessageTrackingLog -Server $srv -MessageId $MessageID -Start $startDate -ResultSize Unlimited -ErrorAction Stop
+        }
+        catch {
+            Write-Verbose "No message tracking log results on $srv for this Message-ID: $_"
+        }
+    }
+
+    if (-not $entries -or $entries.Count -eq 0) {
+        Write-Error "Could not resolve Message-ID '$MessageID' via message tracking logs on any server (searched: $($servers -join ', '); last $MessageTrackingLookbackDays day(s)). The message may be older than the tracking log retention, or the ID may be wrong. Identify the sender/subject/date manually and re-run with -SenderEmail/-Subject/-ReceivedDateTimeFrom/-ReceivedDateTimeTo instead."
+    }
+
+    $entry = $entries | Sort-Object Timestamp | Select-Object -First 1
+    $resolvedSender = $entry.Sender
+    $resolvedSubject = $entry.MessageSubject
+    $resolvedTimestamp = $entry.Timestamp
+
+    if (-not $resolvedSender -or -not $resolvedSubject) {
+        Write-Error "Found a message tracking log entry for '$MessageID' but it's missing sender/subject detail. Identify the sender/subject/date manually and re-run with -SenderEmail/-Subject/-ReceivedDateTimeFrom/-ReceivedDateTimeTo instead."
+    }
+
+    $windowStart = $resolvedTimestamp.AddHours(-$MessageIdDateWindowHours).ToString('yyyy-MM-dd HH:mm:ss')
+    $windowEnd = $resolvedTimestamp.AddHours($MessageIdDateWindowHours).ToString('yyyy-MM-dd HH:mm:ss')
+
+    Write-Host "Resolved via message tracking log:" -ForegroundColor Green
+    Write-Host "  Sender   : $resolvedSender"
+    Write-Host "  Subject  : $resolvedSubject"
+    Write-Host "  Tracked at: $resolvedTimestamp"
+    Write-Host "Narrowing the search to this sender + subject + a $($MessageIdDateWindowHours * 2)-hour window around that timestamp.`n" -ForegroundColor Green
+
+    return [pscustomobject]@{
+        SenderEmail          = $resolvedSender
+        Subject              = $resolvedSubject
+        ReceivedDateTimeFrom = $windowStart
+        ReceivedDateTimeTo   = $windowEnd
+    }
 }
 
 
@@ -553,6 +621,21 @@ try {
     if ($effectiveParameterSetName -eq 'MessageID' -and -not $qMessageID) {
         Write-Error "MessageID is required when using the MessageID parameter set. Example: .\pull-email.ps1 -MessageID '<abc123@contoso.com>' -SearchOnly"
     }
+
+    if ($effectiveParameterSetName -eq 'MessageID') {
+        # Neither on-prem compliance search nor Search-Mailbox support querying by
+        # Message-ID directly - resolve it into a sender+subject+date-window search instead.
+        $resolved = Resolve-MessageIdToCriteria -MessageID $qMessageID
+        $effectiveParameterSetName = 'Criteria'
+        $qMessageID = $null
+        $qSenderEmail = $resolved.SenderEmail
+        $qRecipientEmail = $null
+        $qSubject = $resolved.Subject
+        $qBodyContains = $null
+        $qReceivedDateTimeFrom = $resolved.ReceivedDateTimeFrom
+        $qReceivedDateTimeTo = $resolved.ReceivedDateTimeTo
+    }
+
     if ($effectiveParameterSetName -eq 'Criteria' -and -not ($qSenderEmail -or $qRecipientEmail -or $qSubject -or $qBodyContains -or $qReceivedDateTimeFrom -or $qReceivedDateTimeTo)) {
         Write-Error "At least one of SenderEmail, RecipientEmail, Subject, BodyContains, or ReceivedDateTimeFrom/ReceivedDateTimeTo must be provided when using the Criteria parameter set."
     }
