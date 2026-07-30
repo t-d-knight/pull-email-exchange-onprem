@@ -272,10 +272,23 @@ function Get-SearchCriteriaInteractive {
             Write-Host "`nWhat/when (at least one required):" -ForegroundColor Cyan
             $result.Subject = Read-Host "  Subject contains (blank to skip)"
             $result.BodyContains = Read-Host "  Body contains this link or text (blank to skip)"
-            $result.ReceivedDateTimeFrom = Read-Host "  Received from - yyyy-MM-dd (blank to skip)"
-            if ($result.ReceivedDateTimeFrom) {
-                $result.ReceivedDateTimeTo = Read-Host "  Received to - yyyy-MM-dd"
+
+            $lastDays = Read-Host "  Received in the last N days (blank to specify an exact date range instead)"
+            if ($lastDays) {
+                if ($lastDays -notmatch '^\d+$') {
+                    Write-Error "Received in the last N days must be a whole number."
+                }
+                $result.ReceivedDateTimeTo = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+                $result.ReceivedDateTimeFrom = (Get-Date).AddDays(-[int]$lastDays).ToString('yyyy-MM-dd HH:mm:ss')
+                Write-Host "  Using range: $($result.ReceivedDateTimeFrom) to $($result.ReceivedDateTimeTo)" -ForegroundColor DarkGray
             }
+            else {
+                $result.ReceivedDateTimeFrom = Read-Host "  Received from - yyyy-MM-dd (blank to skip)"
+                if ($result.ReceivedDateTimeFrom) {
+                    $result.ReceivedDateTimeTo = Read-Host "  Received to - yyyy-MM-dd"
+                }
+            }
+
             if (-not $result.Subject -and -not $result.BodyContains -and -not ($result.ReceivedDateTimeFrom -and $result.ReceivedDateTimeTo)) {
                 Write-Error "At least one of subject, body/link text, or a full date range is required to narrow a criteria-based search."
             }
