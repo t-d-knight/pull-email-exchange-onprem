@@ -61,6 +61,12 @@ $CmdDelaySeconds = 5
 $LargeImpactItemThreshold = 25
 $LargeImpactMailboxThreshold = 10
 
+# Above this many matched rows, the console preview switches from a full
+# per-item listing to a condensed sender+subject summary (full detail always
+# still goes to the preview file - a 1,000-mailbox hit is unreadable dumped
+# straight to the console).
+$PreviewDisplayLimit = 20
+
 
 function Connect-ExchangeSession {
     param(
@@ -518,36 +524,47 @@ try {
     Write-Host "`n[Step 1] Validating input parameters..."
     $criteriaSupplied = $MessageID -or $SenderEmail -or $RecipientEmail -or $Subject -or $BodyContains -or $ReceivedDateTimeFrom -or $ReceivedDateTimeTo
 
+    # NOTE: working copies, not the bound parameters themselves. $MessageID/$SenderEmail
+    # carry [ValidateNotNullOrEmpty()], which re-validates on every assignment (not just
+    # initial CLI binding) - writing $null back into whichever field the interactive
+    # menu didn't use would throw.
     if (-not $criteriaSupplied) {
         $interactive = Get-SearchCriteriaInteractive
         $effectiveParameterSetName = $interactive.ParameterSetName
-        $MessageID = $interactive.MessageID
-        $SenderEmail = $interactive.SenderEmail
-        $RecipientEmail = $interactive.RecipientEmail
-        $Subject = $interactive.Subject
-        $BodyContains = $interactive.BodyContains
-        $ReceivedDateTimeFrom = $interactive.ReceivedDateTimeFrom
-        $ReceivedDateTimeTo = $interactive.ReceivedDateTimeTo
+        $qMessageID = $interactive.MessageID
+        $qSenderEmail = $interactive.SenderEmail
+        $qRecipientEmail = $interactive.RecipientEmail
+        $qSubject = $interactive.Subject
+        $qBodyContains = $interactive.BodyContains
+        $qReceivedDateTimeFrom = $interactive.ReceivedDateTimeFrom
+        $qReceivedDateTimeTo = $interactive.ReceivedDateTimeTo
     }
     else {
         $effectiveParameterSetName = $PSCmdlet.ParameterSetName
+        $qMessageID = $MessageID
+        $qSenderEmail = $SenderEmail
+        $qRecipientEmail = $RecipientEmail
+        $qSubject = $Subject
+        $qBodyContains = $BodyContains
+        $qReceivedDateTimeFrom = $ReceivedDateTimeFrom
+        $qReceivedDateTimeTo = $ReceivedDateTimeTo
     }
 
-    if ($effectiveParameterSetName -eq 'MessageID' -and -not $MessageID) {
+    if ($effectiveParameterSetName -eq 'MessageID' -and -not $qMessageID) {
         Write-Error "MessageID is required when using the MessageID parameter set. Example: .\pull-email.ps1 -MessageID '<abc123@contoso.com>' -SearchOnly"
     }
-    if ($effectiveParameterSetName -eq 'Criteria' -and -not ($SenderEmail -or $RecipientEmail -or $Subject -or $BodyContains -or $ReceivedDateTimeFrom -or $ReceivedDateTimeTo)) {
+    if ($effectiveParameterSetName -eq 'Criteria' -and -not ($qSenderEmail -or $qRecipientEmail -or $qSubject -or $qBodyContains -or $qReceivedDateTimeFrom -or $qReceivedDateTimeTo)) {
         Write-Error "At least one of SenderEmail, RecipientEmail, Subject, BodyContains, or ReceivedDateTimeFrom/ReceivedDateTimeTo must be provided when using the Criteria parameter set."
     }
 
     # 1b. Overreach guardrail - block under-specified criteria searches
-    Test-QuerySpecificity -ParameterSetName $effectiveParameterSetName -SenderEmail $SenderEmail -RecipientEmail $RecipientEmail `
-        -Subject $Subject -BodyContains $BodyContains -ReceivedDateTimeFrom $ReceivedDateTimeFrom -ReceivedDateTimeTo $ReceivedDateTimeTo
+    Test-QuerySpecificity -ParameterSetName $effectiveParameterSetName -SenderEmail $qSenderEmail -RecipientEmail $qRecipientEmail `
+        -Subject $qSubject -BodyContains $qBodyContains -ReceivedDateTimeFrom $qReceivedDateTimeFrom -ReceivedDateTimeTo $qReceivedDateTimeTo
 
     # 2. Build KQL query
     Write-Host "`n[Step 2] Building search query..."
-    $kqlQuery = New-ComplianceSearchQuery -MessageID $MessageID -SenderEmail $SenderEmail -RecipientEmail $RecipientEmail `
-        -Subject $Subject -BodyContains $BodyContains -ReceivedDateTimeFrom $ReceivedDateTimeFrom -ReceivedDateTimeTo $ReceivedDateTimeTo
+    $kqlQuery = New-ComplianceSearchQuery -MessageID $qMessageID -SenderEmail $qSenderEmail -RecipientEmail $qRecipientEmail `
+        -Subject $qSubject -BodyContains $qBodyContains -ReceivedDateTimeFrom $qReceivedDateTimeFrom -ReceivedDateTimeTo $qReceivedDateTimeTo
     Write-Host "Final KQL Query: $kqlQuery" -ForegroundColor Green
 
     $itemsFound = 0
@@ -585,39 +602,69 @@ try {
         $preview = Get-ComplianceSearchAction -Identity $SearchActionPreviewName -Details
 
         # NOTE: this text-parses a free-text Results string with no documented stable
-        # format. Treat this listing as a convenience, not ground truth - cross-check
-        # $preview.Results directly (Write-Host it, or dump to a file) before you rely
-        # on it as your go/no-go for a delete.
+        # format. Treat this listing as a convenience, not ground truth - the full raw
+        # payload is always written to $previewFile so you can cross-check it before
+        # relying on this as your go/no-go for a delete.
         $rawResults = $preview.Results.Trim('{', '}').Trim()
         $entries = $rawResults -split ',\s*(?=Location:)'
-        Write-Host "`n  Matched emails ($($entries.Count)):" -ForegroundColor Cyan
-        Write-Host "  $('-' * 60)" -ForegroundColor Cyan
-        $i = 1
-        $locations = @()
-        foreach ($entry in $entries) {
+
+        $rows = foreach ($entry in $entries) {
             $fields = @{}
             foreach ($part in ($entry.Trim() -split ';\s*')) {
                 if ($part -match '^([^:]+):\s*(.+)$') {
                     $fields[$Matches[1].Trim()] = $Matches[2].Trim()
                 }
             }
-            if ($fields['Location']) { $locations += $fields['Location'] }
-            $senderDisplay = if ($SenderEmail) { "$($fields['Sender']) <$SenderEmail>" } else { $fields['Sender'] }
-            Write-Host "  [$i] Mailbox  : $($fields['Location'])"
-            Write-Host "      Sender   : $senderDisplay"
-            Write-Host "      Subject  : $($fields['Subject'])"
-            Write-Host "      Received : $($fields['Received Time'])"
-            Write-Host "      Size     : $($fields['Size']) bytes"
-            Write-Host "  $('-' * 60)" -ForegroundColor DarkGray
-            $i++
+            [pscustomobject]@{
+                Mailbox  = $fields['Location']
+                Sender   = if ($qSenderEmail) { "$($fields['Sender']) <$qSenderEmail>" } else { $fields['Sender'] }
+                Subject  = $fields['Subject']
+                Received = $fields['Received Time']
+                Size     = $fields['Size']
+            }
         }
-        $mailboxCount = @($locations | Select-Object -Unique).Count
+        $mailboxCount = @($rows.Mailbox | Select-Object -Unique).Count
 
-        Write-Host "`nRaw preview payload (ground truth, cross-check against the parsed list above):" -ForegroundColor DarkGray
-        Write-Host $preview.Results -ForegroundColor DarkGray
+        $previewFile = Join-Path $PSScriptRoot "$SearchName`_preview.txt"
+        $rows | Format-Table -AutoSize | Out-String -Width 300 | Set-Content -Path $previewFile
+        Add-Content -Path $previewFile -Value "`n--- RAW PREVIEW PAYLOAD (ground truth) ---`n$($preview.Results)"
+
+        Write-Host "`n  Matched emails ($($rows.Count)) across $mailboxCount mailbox(es)." -ForegroundColor Cyan
+        Write-Host "  Full detail (and the raw payload) written to: $previewFile" -ForegroundColor Cyan
+        Write-Host "  $('-' * 60)" -ForegroundColor Cyan
+
+        if ($rows.Count -le $PreviewDisplayLimit) {
+            $i = 1
+            foreach ($row in $rows) {
+                Write-Host "  [$i] Mailbox  : $($row.Mailbox)"
+                Write-Host "      Sender   : $($row.Sender)"
+                Write-Host "      Subject  : $($row.Subject)"
+                Write-Host "      Received : $($row.Received)"
+                Write-Host "      Size     : $($row.Size) bytes"
+                Write-Host "  $('-' * 60)" -ForegroundColor DarkGray
+                $i++
+            }
+        }
+        else {
+            Write-Host "  $($rows.Count) items is above the inline display limit ($PreviewDisplayLimit) - showing a condensed summary grouped by sender + subject:" -ForegroundColor Yellow
+            foreach ($group in ($rows | Group-Object -Property Sender, Subject)) {
+                $first = $group.Group[0]
+                $others = $group.Count - 1
+                Write-Host "  Sender  : $($first.Sender)"
+                Write-Host "  Subject : $($first.Subject)"
+                Write-Host "  Example : $($first.Mailbox)  (received $($first.Received), $($first.Size) bytes)"
+                if ($others -gt 0) {
+                    Write-Host "            + $others other mailbox(es) with this same sender/subject" -ForegroundColor DarkGray
+                }
+                Write-Host "  $('-' * 60)" -ForegroundColor DarkGray
+            }
+        }
     }
     else {
         # Legacy mode: no single org-wide query cmdlet exists, so we loop per mailbox.
+        # Search-Mailbox's -EstimateResultOnly only gives a per-mailbox item count, not
+        # per-message sender/subject detail, so this can't be grouped the same way Modern
+        # mode's preview is - it's a mailbox list, capped the same way for large hits.
         Write-Host "`n[Step 3-4] Running legacy Search-Mailbox preview across all mailboxes..."
         $legacyMatches = @(Invoke-LegacyMailboxPreview -SearchQuery $kqlQuery -TargetFolder $SearchName)
         $itemsFound = ($legacyMatches | Measure-Object -Property ItemCount -Sum).Sum
@@ -629,13 +676,29 @@ try {
             exit 0
         }
 
+        $previewFile = Join-Path $PSScriptRoot "$SearchName`_preview.txt"
+        $legacyMatches | Format-Table -AutoSize | Out-String -Width 300 | Set-Content -Path $previewFile
+
         Write-Host "`nSearch complete. Found $itemsFound email(s) across $mailboxCount mailbox(es)." -ForegroundColor Green
+        Write-Host "Full detail written to: $previewFile" -ForegroundColor Cyan
         Write-Host "`n  Matched mailboxes:" -ForegroundColor Cyan
         Write-Host "  $('-' * 60)" -ForegroundColor Cyan
-        foreach ($row in $legacyMatches) {
-            Write-Host "  Mailbox : $($row.Mailbox)"
-            Write-Host "  Items   : $($row.ItemCount)"
-            Write-Host "  $('-' * 60)" -ForegroundColor DarkGray
+
+        if ($legacyMatches.Count -le $PreviewDisplayLimit) {
+            foreach ($row in $legacyMatches) {
+                Write-Host "  Mailbox : $($row.Mailbox)"
+                Write-Host "  Items   : $($row.ItemCount)"
+                Write-Host "  $('-' * 60)" -ForegroundColor DarkGray
+            }
+        }
+        else {
+            Write-Host "  $($legacyMatches.Count) mailboxes is above the inline display limit ($PreviewDisplayLimit) - showing the first $PreviewDisplayLimit, see the file above for the rest:" -ForegroundColor Yellow
+            foreach ($row in ($legacyMatches | Select-Object -First $PreviewDisplayLimit)) {
+                Write-Host "  Mailbox : $($row.Mailbox)"
+                Write-Host "  Items   : $($row.ItemCount)"
+                Write-Host "  $('-' * 60)" -ForegroundColor DarkGray
+            }
+            Write-Host "  ...and $($legacyMatches.Count - $PreviewDisplayLimit) more mailbox(es) - see $previewFile" -ForegroundColor DarkGray
         }
     }
 
