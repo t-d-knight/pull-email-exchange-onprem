@@ -129,12 +129,20 @@ function Connect-ExchangeSession {
     $connectionUri = "${scheme}://$Server/PowerShell/"
 
     Write-Host "Connecting to $connectionUri as $($Credential.UserName) ..." -ForegroundColor Cyan
-    # -Verbose:$false overrides the script-wide $VerbosePreference = 'Continue' - without it,
-    # Import-PSSession dumps an Exporting/Importing line for every one of the ~800 proxied
-    # Exchange cmdlets, burying everything useful underneath it.
-    $session = New-PSSession -ConfigurationName Microsoft.Exchange -ConnectionUri $connectionUri -Authentication Kerberos -Credential $Credential -ErrorAction Stop -Verbose:$false
+    # Import-PSSession's internal module-import step dumps an Exporting/Importing line for
+    # every one of the ~800 proxied Exchange cmdlets under the script-wide $VerbosePreference
+    # = 'Continue' - and it does this regardless of -Verbose:$false on the call itself, so
+    # the preference variable has to be flipped directly for these two calls to actually quiet it.
+    $previousVerbosePreference = $VerbosePreference
+    $VerbosePreference = 'SilentlyContinue'
+    try {
+        $session = New-PSSession -ConfigurationName Microsoft.Exchange -ConnectionUri $connectionUri -Authentication Kerberos -Credential $Credential -ErrorAction Stop
 
-    Import-PSSession $session -DisableNameChecking -AllowClobber -ErrorAction Stop -Verbose:$false | Out-Null
+        Import-PSSession $session -DisableNameChecking -AllowClobber -ErrorAction Stop | Out-Null
+    }
+    finally {
+        $VerbosePreference = $previousVerbosePreference
+    }
 
     try {
         $null = Get-OrganizationConfig -ErrorAction Stop
@@ -962,13 +970,16 @@ catch {
     exit 1
 }
 finally {
+    # Flip $VerbosePreference directly (not just -Verbose:$false) - same reason as in
+    # Connect-ExchangeSession: tearing down the ~800 proxied functions otherwise dumps a
+    # "Removing the imported ... function" line for every one of them.
+    $previousVerbosePreference = $VerbosePreference
+    $VerbosePreference = 'SilentlyContinue'
     if ($IsEXO) {
-        try { Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue -Verbose:$false } catch { }
+        try { Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue } catch { }
     }
     elseif ($Session) {
-        # -Verbose:$false - same reason as the New-PSSession/Import-PSSession calls in
-        # Connect-ExchangeSession: without it, tearing down the ~800 proxied functions
-        # dumps a "Removing the imported ... function" line for every one of them.
-        Remove-PSSession $Session -ErrorAction SilentlyContinue -Verbose:$false
+        Remove-PSSession $Session -ErrorAction SilentlyContinue
     }
+    $VerbosePreference = $previousVerbosePreference
 }
