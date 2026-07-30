@@ -129,19 +129,22 @@ function Connect-ExchangeSession {
     $connectionUri = "${scheme}://$Server/PowerShell/"
 
     Write-Host "Connecting to $connectionUri as $($Credential.UserName) ..." -ForegroundColor Cyan
-    # Import-PSSession's internal module-import step dumps an Exporting/Importing line for
-    # every one of the ~800 proxied Exchange cmdlets under the script-wide $VerbosePreference
-    # = 'Continue' - and it does this regardless of -Verbose:$false on the call itself, so
-    # the preference variable has to be flipped directly for these two calls to actually quiet it.
-    $previousVerbosePreference = $VerbosePreference
-    $VerbosePreference = 'SilentlyContinue'
+    # Import-PSSession is itself implemented as a function in a built-in module, and its
+    # internal Import-Module call reads $VerbosePreference from ITS OWN module scope, not
+    # from this function's local scope - a plain (non-$global:) reassignment here only
+    # shadows the variable within Connect-ExchangeSession and never reaches that nested
+    # call, which is why -Verbose:$false and a local override both failed to quiet the
+    # "Exporting/Importing function" dump. Flipping the actual global value is what
+    # both scopes fall back to when neither has its own local override.
+    $previousVerbosePreference = $global:VerbosePreference
+    $global:VerbosePreference = 'SilentlyContinue'
     try {
         $session = New-PSSession -ConfigurationName Microsoft.Exchange -ConnectionUri $connectionUri -Authentication Kerberos -Credential $Credential -ErrorAction Stop
 
         Import-PSSession $session -DisableNameChecking -AllowClobber -ErrorAction Stop | Out-Null
     }
     finally {
-        $VerbosePreference = $previousVerbosePreference
+        $global:VerbosePreference = $previousVerbosePreference
     }
 
     try {
@@ -983,16 +986,18 @@ catch {
     exit 1
 }
 finally {
-    # Flip $VerbosePreference directly (not just -Verbose:$false) - same reason as in
-    # Connect-ExchangeSession: tearing down the ~800 proxied functions otherwise dumps a
-    # "Removing the imported ... function" line for every one of them.
-    $previousVerbosePreference = $VerbosePreference
-    $VerbosePreference = 'SilentlyContinue'
+    # Flip the GLOBAL $VerbosePreference (not a local/script-scope copy) - same reason as in
+    # Connect-ExchangeSession: tearing down the ~800 proxied functions happens inside a
+    # different module's own scope, which falls back to the true global value, not this
+    # script's local one. Without this it dumps a "Removing the imported ... function"
+    # line for every one of them.
+    $previousVerbosePreference = $global:VerbosePreference
+    $global:VerbosePreference = 'SilentlyContinue'
     if ($IsEXO) {
         try { Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue } catch { }
     }
     elseif ($Session) {
         Remove-PSSession $Session -ErrorAction SilentlyContinue
     }
-    $VerbosePreference = $previousVerbosePreference
+    $global:VerbosePreference = $previousVerbosePreference
 }
