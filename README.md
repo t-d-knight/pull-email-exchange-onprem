@@ -109,7 +109,7 @@ The script checks for this automatically and, if missing, provides the `New-Mail
 
 ## Exchange Online
 
-Install the Exchange Online Management module:
+Install the Exchange Online Management module, **version 3.9.0 or later** (needed for the `-EnableSearchOnlySession` connection flag the script relies on - older versions will fail when starting a compliance search over the newer REST-based backend):
 
 ```powershell
 Install-Module ExchangeOnlineManagement -Scope CurrentUser

@@ -113,7 +113,12 @@ function Connect-ExchangeSession {
         $global:VerbosePreference = 'SilentlyContinue'
         try {
             Import-Module ExchangeOnlineManagement -ErrorAction Stop
-            Connect-IPPSSession -UserPrincipalName $upn -WarningAction SilentlyContinue -ErrorAction Stop
+            # -EnableSearchOnlySession: required (ExchangeOnlineManagement 3.9.0+) for
+            # New-ComplianceSearch/Start-ComplianceSearch to actually work over the newer
+            # REST-based Security & Compliance backend - without it, Start-ComplianceSearch
+            # fails with "Please close the current session and open a new session using
+            # Connect-IPPSSession with the -EnableSearchOnlySession flag."
+            Connect-IPPSSession -UserPrincipalName $upn -EnableSearchOnlySession -WarningAction SilentlyContinue -ErrorAction Stop
         }
         finally {
             $global:VerbosePreference = $previousVerbosePreference
