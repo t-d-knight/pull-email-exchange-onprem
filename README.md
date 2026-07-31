@@ -172,7 +172,7 @@ After completing a search, the script offers to perform additional searches usin
 | `-RecipientEmail`                               | Searches To/Cc/Bcc.                                                                    |
 | `-Subject`                                      | Subject contains. On-premises full-text indexing ignores trailing numbers.             |
 | `-BodyContains`                                 | Body text or URL contains.                                                             |
-| `-ReceivedDateTimeFrom` / `-ReceivedDateTimeTo` | Date range (`yyyy-MM-dd` or `yyyy-MM-dd HH:mm:ss`).                                    |
+| `-ReceivedDateTimeFrom` / `-ReceivedDateTimeTo` | Date range (`yyyy-MM-dd` or `yyyy-MM-dd HH:mm:ss`), interpreted in the local machine's time zone. A date given without a time (e.g. just `2026-07-26`) is treated as the start of that day for `-From` and the *end* of that day for `-To` - so the same date on both ends covers the whole day, not a single instant. The resolved range is echoed back in local time before the search runs so you can confirm it matches what you expect. |
 | `-DeleteType`                                   | `Soft` (default) or `Hard`. Hard Delete is Exchange Online only.                       |
 | `-SearchOnly`                                   | Preview results without deleting anything.                                             |
 | `-Force`                                        | Skips standard confirmation prompts.                                                   |

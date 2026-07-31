@@ -411,6 +411,14 @@ function New-ComplianceSearchQuery {
 
     $queryParts = @()
 
+    # Defensive trim - treat a whitespace-only value the same as "not provided" so a
+    # stray space typed into a prompt can't sneak an empty/blank clause into the query.
+    $MessageID = if ($MessageID) { $MessageID.Trim() } else { $MessageID }
+    $SenderEmail = if ($SenderEmail) { $SenderEmail.Trim() } else { $SenderEmail }
+    $RecipientEmail = if ($RecipientEmail) { $RecipientEmail.Trim() } else { $RecipientEmail }
+    $Subject = if ($Subject) { $Subject.Trim() } else { $Subject }
+    $BodyContains = if ($BodyContains) { $BodyContains.Trim() } else { $BodyContains }
+
     if ($MessageID) {
         # Message-ID search (most specific)
         # KQL: internetmessageid:"<exact-id>"
@@ -438,8 +446,21 @@ function New-ComplianceSearchQuery {
         if ($ReceivedDateTimeFrom -and $ReceivedDateTimeTo) {
             try {
                 $dtFrom = [datetimeoffset]::Parse($ReceivedDateTimeFrom)
-                $dateFromStr = $dtFrom.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
                 $dtTo = [datetimeoffset]::Parse($ReceivedDateTimeTo)
+
+                # A date-only "To" value (e.g. "2026-07-26") parses to midnight of that
+                # day - if left as-is, a same-day range (or any date-only range) becomes
+                # a zero-width instant instead of covering the whole day(s). Bump it to
+                # the last moment of that day instead, unless a time-of-day was actually
+                # given (in which case it won't land exactly on midnight).
+                if ($dtTo.TimeOfDay -eq [timespan]::Zero) {
+                    $dtTo = $dtTo.AddDays(1).AddTicks(-1)
+                }
+
+                $localTz = (Get-TimeZone -ErrorAction SilentlyContinue).Id
+                Write-Host "  Date range (local$(if ($localTz) { ", $localTz" })): $($dtFrom.ToString('yyyy-MM-dd HH:mm:ss')) to $($dtTo.ToString('yyyy-MM-dd HH:mm:ss'))" -ForegroundColor DarkGray
+
+                $dateFromStr = $dtFrom.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
                 $dateToStr = $dtTo.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
                 $queryParts += "(received:$dateFromStr..$dateToStr)"
             }
