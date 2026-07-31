@@ -14,7 +14,7 @@ Built primarily for incident response—such as removing a phishing email or a m
 <!-- separates the two callouts so markdownlint doesn't read the blank line as being inside a single blockquote -->
 
 > [!NOTE]
-> **The fine print, delivered casually:** this is provided as-is, no warranty, no guarantee it won't do something weird in your environment, no promise of support. It's been built and tested against a real hybrid Exchange setup and worked at the time of writing - your mileage, Exchange version, and RBAC config may vary. Read the code before you run it, always start with `-SearchOnly`, and don't come looking for us if it eats a mailbox you didn't mean to touch. If pain persists, consult your senior sysadmin (or a support group, whichever's faster to reach). Use of this script constitutes acceptance that you, not the person who wrote it, are on the hook for what it does in your org.
+> **The fine print:** this is provided as-is, no warranty, no guarantee it won't do something weird in your environment, no promise of support. It's been built and tested against a real hybrid Exchange setup and worked at the time of writing - your mileage, Exchange version, and RBAC config may vary. Read the code before you run it, always start with `-SearchOnly`, and don't come looking for us if it eats a mailbox you didn't mean to touch. If pain persists, consult your senior sysadmin (or a support group, whichever's faster to reach). Use of this script constitutes acceptance that you, not the person who wrote it, are on the hook for what it does in your org.
 
 ---
 
