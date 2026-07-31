@@ -101,7 +101,13 @@ In most environments this is achieved by membership of:
 * **Discovery Management** (on-premises)
 * An appropriate Microsoft 365 eDiscovery / Compliance role group (Exchange Online)
 
-The script validates these assignments before performing any search.
+On-premises, the script validates the exact role assignment (`Get-ManagementRoleAssignment`)
+before performing any search. **Exchange Online's Security & Compliance PowerShell session
+doesn't expose that cmdlet at all** - RBAC there is managed through the Purview compliance
+portal, not this session - so for EXO the script instead does a basic capability check
+(`Get-ComplianceSearch -ResultSize 1`) to confirm the account can at least reach compliance
+search. This does not confirm the `Search And Purge` role specifically; if a delete action
+fails with an authorization error, check for that role in the Purview compliance portal.
 
 ---
 

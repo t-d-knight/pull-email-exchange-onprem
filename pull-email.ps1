@@ -96,7 +96,6 @@ function Connect-ExchangeSession {
         if (-not (Get-Module -ListAvailable -Name ExchangeOnlineManagement)) {
             Write-Error "Exchange Online support requires the ExchangeOnlineManagement module, which isn't installed. Install it first: Install-Module ExchangeOnlineManagement -Scope CurrentUser"
         }
-        Import-Module ExchangeOnlineManagement -ErrorAction Stop -Verbose:$false
 
         $upn = if ($Credential) { $Credential.UserName } else { Read-Host "Exchange Online admin UPN (e.g. admin@contoso.onmicrosoft.com)" }
         if (-not $upn) {
@@ -104,7 +103,19 @@ function Connect-ExchangeSession {
         }
 
         Write-Host "Connecting to Exchange Online (Security & Compliance PowerShell) as $upn - a sign-in prompt may appear..." -ForegroundColor Cyan
-        Connect-IPPSSession -UserPrincipalName $upn -WarningAction SilentlyContinue -Verbose:$false -ErrorAction Stop
+        # Same reason as the on-prem branch below - Import-Module's and Connect-IPPSSession's
+        # own internal module-loading code reads the GLOBAL $VerbosePreference, not a local
+        # override, so it has to be flipped at global scope to actually quiet the
+        # Importing-cmdlet/Exporting-function dump (~500+ lines for this module).
+        $previousVerbosePreference = $global:VerbosePreference
+        $global:VerbosePreference = 'SilentlyContinue'
+        try {
+            Import-Module ExchangeOnlineManagement -ErrorAction Stop
+            Connect-IPPSSession -UserPrincipalName $upn -WarningAction SilentlyContinue -ErrorAction Stop
+        }
+        finally {
+            $global:VerbosePreference = $previousVerbosePreference
+        }
 
         if (-not $Credential) {
             # Connect-IPPSSession is modern-auth/interactive (MFA-capable) and doesn't take
@@ -210,6 +221,23 @@ function Test-RequiredPermissions {
     elseif ($accountName -match '^(.+)@') { $accountName = $Matches[1] }
 
     Write-Host "Checking '$accountName' has the RBAC role(s) needed for $Mode mode..." -ForegroundColor Cyan
+
+    if (-not (Get-Command -Name Get-ManagementRoleAssignment -ErrorAction SilentlyContinue)) {
+        # Exchange Online's Security & Compliance PowerShell (Connect-IPPSSession) doesn't
+        # expose role-assignment cmdlets at all - RBAC there is managed through the Purview
+        # compliance portal, not this session. There's no way to check a specific role name
+        # here, so fall back to a light capability probe and let the search/delete cmdlets
+        # enforce real authorization when they actually run.
+        Write-Host "Get-ManagementRoleAssignment isn't available in this session (expected for Exchange Online) - running a basic capability check instead." -ForegroundColor Yellow
+        try {
+            $null = Get-ComplianceSearch -ResultSize 1 -ErrorAction Stop
+        }
+        catch {
+            Write-Error "Account '$accountName' cannot run Get-ComplianceSearch - it likely lacks a compliance/eDiscovery role (e.g. eDiscovery Manager) in Microsoft Purview. Details: $_"
+        }
+        Write-Host "Basic capability check passed for '$accountName'. This does not confirm the 'Search And Purge' role specifically - if a delete action fails with an authorization error, check for that role in the Purview compliance portal." -ForegroundColor Yellow
+        return
+    }
 
     $assignments = Get-ManagementRoleAssignment -RoleAssignee $accountName -ErrorAction SilentlyContinue | Where-Object { $_.Enabled }
     $roleNames = @($assignments | Select-Object -ExpandProperty Role -Unique)
@@ -881,8 +909,8 @@ function Invoke-EmailSearchAndDelete {
         Write-Host "========================================" -ForegroundColor Yellow
 
         if (-not $Force) {
-            $confirmation = Read-Host "`nDo you want to proceed with ${DeleteType} deletion? (yes/no)"
-            if ($confirmation -ne 'yes') {
+            $confirmation = Read-Host "`nDo you want to proceed with ${DeleteType} deletion? (y/n)"
+            if ($confirmation -notin @('y', 'yes')) {
                 Write-Host "Deletion cancelled by user." -ForegroundColor Yellow
                 if ($SearchMode -eq 'Modern') { Remove-ComplianceSearch -Identity $SearchName -Confirm:$false }
                 return
@@ -992,8 +1020,8 @@ try {
         Invoke-EmailSearchAndDelete -SearchMode $SearchMode -BoundParameterSetName $PSCmdlet.ParameterSetName -IsEXO:$IsEXO -UseBoundCriteria:$isFirstRun
         $isFirstRun = $false
 
-        $again = Read-Host "`nRun another search with this session? (yes/no)"
-        $runAnother = ($again -eq 'yes')
+        $again = Read-Host "`nRun another search with this session? (y/n)"
+        $runAnother = ($again -in @('y', 'yes'))
         if ($runAnother) {
             Write-Host "`n======================================" -ForegroundColor Cyan
             Write-Host "Starting another search (same session)" -ForegroundColor Cyan
