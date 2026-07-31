@@ -11,10 +11,35 @@ Built primarily for incident response—such as removing a phishing email or a m
 > [!WARNING]
 > This script is capable of searching and deleting email across every mailbox in an Exchange organisation. Always run with `-SearchOnly` first unless you are completely confident your search criteria only match the intended messages.
 
-<!-- separates the two callouts so markdownlint doesn't read the blank line as being inside a single blockquote -->
+# Disclaimer
 
-> [!NOTE]
-> **The fine print:** this is provided as-is, no warranty, no guarantee it won't do something weird in your environment, no promise of support. It's been built and tested against a real hybrid Exchange setup and worked at the time of writing - your mileage, Exchange version, and RBAC config may vary. Read the code before you run it, always start with `-SearchOnly`, and don't come looking for us if it eats a mailbox you didn't mean to touch. If pain persists, consult your senior sysadmin (or a support group, whichever's faster to reach). Use of this script constitutes acceptance that you, not the person who wrote it, are on the hook for what it does in your org.
+**The fine print:** this script is provided as-is. No warranty. No guarantees. No magical safety net. If it summons an eldritch Exchange demon that's been lurking since the 2010 migration, that's on you.
+
+It's been tested in a real hybrid Exchange environment and behaved itself. Your environment, however, may have been lovingly assembled over 15 years by six different admins, three MSPs, a consultant who disappeared mid-project, and Steve from Finance who somehow got Domain Admin in 2017. Results may vary.
+
+Before you run it:
+
+* Read the code.
+* Use `-SearchOnly`.
+* Read the output.
+* Think about your life choices.
+* Then, and only then, let it loose.
+
+Don't just download a random PowerShell script from the internet, mash Enter a few times, and hope for the best. That's how you end up explaining to management why Karen's mailbox now contains the square root of fuck all.
+
+No support is included, implied, or available. If it explodes, your first ports of call are:
+
+* Your backups.
+* Your senior sysadmin.
+* The nearest pub.
+
+If none of those help, congratulations—you've probably just discovered a brand new Exchange feature.
+
+By running this script, you acknowledge that you are the one behind the keyboard. You're responsible for checking what it does, where it runs, and what it deletes. If you ignore `-SearchOnly`, fire it at Production on a Friday afternoon, and immediately regret your decisions, that's a valuable learning experience.
+
+The author accepts no responsibility for lost mail, broken environments, emergency CAB meetings, uncomfortable conversations with management, or any increase in alcohol consumption resulting from use of this script.
+
+**You've been warned. Send it.**
 
 ---
 
