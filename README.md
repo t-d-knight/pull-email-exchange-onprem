@@ -1,5 +1,7 @@
 # pull-email.ps1
 
+**Current version: 1.0.0** (printed in the script's own startup banner - check that matches this file if in doubt which copy you're running).
+
 Searches for a specific email (or a set of matching emails) across mailboxes and, after review, soft- or hard-deletes it.
 
 Supports both **Exchange Online** and **on-premises Exchange**, automatically detecting the best search implementation available in the connected environment.

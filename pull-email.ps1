@@ -49,6 +49,8 @@ param(
     [switch]$Force
 )
 
+$ScriptVersion = '1.0.0'
+
 $ErrorActionPreference = 'Stop'
 $VerbosePreference = 'Continue'
 
@@ -991,7 +993,7 @@ $IsEXO = $false
 
 try {
     Write-Host "======================================" -ForegroundColor Cyan
-    Write-Host "Exchange Compliance Search & Delete" -ForegroundColor Cyan
+    Write-Host "Exchange Compliance Search & Delete (v$ScriptVersion)" -ForegroundColor Cyan
     if ($SearchOnly) { Write-Host "MODE: SEARCH ONLY - no delete action will run" -ForegroundColor Green }
     Write-Host "======================================" -ForegroundColor Cyan
 
