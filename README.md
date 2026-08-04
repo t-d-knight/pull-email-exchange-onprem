@@ -1,6 +1,6 @@
 # pull-email.ps1
 
-**Current version: 1.0.0** (printed in the script's own startup banner - check that matches this file if in doubt which copy you're running).
+**Current version: 1.1.0** (printed in the script's own startup banner - check that matches this file if in doubt which copy you're running).
 
 Searches for a specific email (or a set of matching emails) across mailboxes and, after review, soft- or hard-deletes it.
 
@@ -60,6 +60,7 @@ The author accepts no responsibility for lost mail, broken environments, emergen
 * Soft Delete and Hard Delete support (where supported)
 * Automatic RBAC permission validation
 * Query safety validation to prevent overly broad searches
+* Automatic detection and abort of runaway/unfiltered searches while they're still running
 * Preview matched items before deletion
 * Large-impact confirmation safeguards
 * Reuses the existing Exchange session for multiple searches without reconnecting
@@ -158,6 +159,8 @@ You'll be prompted for:
 3. Search criteria
 4. Delete confirmation (if applicable)
 
+For the date range specifically, you can either give an exact from/to range, or just answer "received in the last N days" for a quick relative filter - leave that blank to fall through to the exact from/to prompts instead.
+
 After completing a search, the script offers to perform additional searches using the same Exchange session, avoiding repeated authentication.
 
 ---
@@ -227,6 +230,7 @@ Because the script searches the entire organisation, several safeguards are buil
 * Large-impact operations (more than 25 items or 10 mailboxes) require typing a randomly generated confirmation token.
 * Hard Delete operations always require the large-impact confirmation.
 * Required RBAC permissions are validated before any search begins.
+* **Runaway-search abort**: while a search is still running, if it's already matched more than 50,000 items it's stopped and aborted automatically rather than left to run out its full timeout - that many matches almost always means a malformed or unsupported query clause silently turned into an unfiltered, organisation-wide scan rather than a genuine result set.
 
 ---
 
@@ -246,7 +250,7 @@ For large result sets, the console displays a condensed summary while the previe
 
 ### Exchange Online
 
-Uses native Message-ID searching via the Exchange Online compliance search engine.
+Uses native Message-ID searching via the Exchange Online compliance search engine. The angle brackets (`< >`) that surround a Message-ID as header syntax are stripped automatically before searching - they aren't part of the indexed value, and leaving them in causes the filter to silently fail to match (in testing, this turned a single-message search into an unfiltered scan of the entire tenant).
 
 ### On-premises Exchange
 
@@ -259,7 +263,8 @@ Because on-premises Exchange does not support Message-ID as a KQL property, the 
 Resolution will fail if:
 
 * the tracking logs no longer contain the message,
-* the message never traversed on-premises transport (for example, Exchange Online mailboxes in a hybrid deployment).
+* the message never traversed on-premises transport (for example, Exchange Online mailboxes in a hybrid deployment),
+* the Message-ID value itself is incorrect.
 
 ---
 
@@ -276,7 +281,7 @@ Legacy mode uses `Search-Mailbox`, which has several inherent limitations:
 
 # Cleanup behaviour
 
-Compliance searches created during normal operation are automatically removed after completion or on most failure paths.
+Compliance searches created during normal operation are automatically removed after completion. On a failure or an abort (including the runaway-search abort above), the script stops the search first - in case it's still actively running, which can prevent a straight removal - then removes it, and explicitly tells you whether that cleanup actually succeeded. If cleanup fails, you'll see a clear warning telling you to check its status manually rather than the script silently leaving it behind.
 
 When `-SearchOnly` is used, compliance searches are intentionally left in place so administrators can inspect them before manual cleanup.
 

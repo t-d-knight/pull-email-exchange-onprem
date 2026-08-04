@@ -49,7 +49,7 @@ param(
     [switch]$Force
 )
 
-$ScriptVersion = '1.0.0'
+$ScriptVersion = '1.1.0'
 
 $ErrorActionPreference = 'Stop'
 $VerbosePreference = 'Continue'
@@ -63,6 +63,15 @@ $CmdDelaySeconds = 5
 # confirmation is required instead of a plain yes/no (see Confirm-LargeImpact).
 $LargeImpactItemThreshold = 25
 $LargeImpactMailboxThreshold = 10
+
+# Sanity ceiling for a search that's still running (see Wait-ComplianceSearch). This is
+# deliberately much higher than $LargeImpactItemThreshold above - a legitimate incident
+# search can plausibly match hundreds or low thousands of items. Above this many while
+# still InProgress, the query almost certainly isn't filtering as intended (e.g. an
+# unrecognized/malformed KQL clause got silently dropped, turning it into an unfiltered
+# org-wide scan) rather than genuinely needing that many results - abort early instead of
+# waiting out the full timeout while it keeps scanning.
+$RunawaySearchItemCeiling = 50000
 
 # Above this many matched rows, the console preview switches from a full
 # per-item listing to a condensed sender+subject summary (full detail always
@@ -455,9 +464,13 @@ function New-ComplianceSearchQuery {
     $BodyContains = if ($BodyContains) { $BodyContains.Trim() } else { $BodyContains }
 
     if ($MessageID) {
-        # Message-ID search (most specific)
-        # KQL: internetmessageid:"<exact-id>"
-        $queryParts += "(MessageId:""$MessageID"")"
+        # Message-ID search (most specific). The angle brackets that RFC 5322 headers (and
+        # most mail clients/tools) display around a Message-ID are delimiter syntax, not
+        # part of the indexed value - leaving them in makes the messageid:"..." clause fail
+        # to match as a filter, and the search silently falls back to matching everything
+        # instead of erroring (seen live: a single-message search returned 95M+ "items found").
+        $cleanMessageId = $MessageID.TrimStart('<').TrimEnd('>')
+        $queryParts += "(MessageId:""$cleanMessageId"")"
     }
     else {
         # Criteria-based search
@@ -517,7 +530,8 @@ function New-ComplianceSearchQuery {
 function Wait-ComplianceSearch {
     param(
         [string]$Identity,
-        [int]$TimeoutSeconds = 600
+        [int]$TimeoutSeconds = 600,
+        [int]$RunawayItemCeiling = 0
     )
 
     $elapsed = 0
@@ -539,6 +553,17 @@ function Wait-ComplianceSearch {
         }
         else {
             Write-Host "  Searching... Status: $status, Items found so far: $($search.Items)" -ForegroundColor Yellow
+
+            # A search still climbing well past any plausible legitimate result count almost
+            # certainly means the query isn't filtering as intended (e.g. an unrecognized/
+            # malformed KQL clause was silently dropped, turning it into an unfiltered
+            # org-wide scan) rather than genuinely needing that many results. Stop it and
+            # abort now instead of waiting out the full timeout while it keeps scanning.
+            if ($RunawayItemCeiling -gt 0 -and $search.Items -gt $RunawayItemCeiling) {
+                try { Stop-ComplianceSearch -Identity $Identity -Confirm:$false -ErrorAction Stop } catch { }
+                Write-Error "Search '$Identity' has matched $($search.Items) item(s) while still running - far beyond what a legitimate targeted search should return. Aborting: the query almost certainly isn't filtering as intended (check for a malformed/unsupported KQL clause, e.g. a Message-ID with its angle brackets still attached). The search has been stopped."
+            }
+
             Start-Sleep -Seconds $checkInterval
             $elapsed += $checkInterval
         }
@@ -776,7 +801,7 @@ function Invoke-EmailSearchAndDelete {
             Start-ComplianceSearch -Identity $SearchName
             Start-Sleep -Seconds $CmdDelaySeconds
 
-            $searchResult = Wait-ComplianceSearch -Identity $SearchName -TimeoutSeconds ($QueryTimeoutMinutes * 60)
+            $searchResult = Wait-ComplianceSearch -Identity $SearchName -TimeoutSeconds ($QueryTimeoutMinutes * 60) -RunawayItemCeiling $RunawaySearchItemCeiling
             $itemsFound = $searchResult.Items
 
             if ($itemsFound -eq 0) {
@@ -985,7 +1010,20 @@ function Invoke-EmailSearchAndDelete {
     }
     catch {
         if ($SearchMode -eq 'Modern') {
-            try { Remove-ComplianceSearch -Identity $SearchName -Confirm:$false -ErrorAction SilentlyContinue } catch { }
+            # Best-effort cleanup after a failed/aborted search. Stop first, in case it's
+            # still actively running (e.g. the runaway-item abort above) - Remove-ComplianceSearch
+            # isn't guaranteed to tear down a search that's still InProgress. Report whether
+            # this actually worked instead of swallowing the result either way - the whole point
+            # of getting fixed was that a failed cleanup here previously looked identical to a
+            # successful one.
+            try { Stop-ComplianceSearch -Identity $SearchName -Confirm:$false -ErrorAction SilentlyContinue } catch { }
+            try {
+                Remove-ComplianceSearch -Identity $SearchName -Confirm:$false -ErrorAction Stop
+                Write-Host "Cleaned up compliance search '$SearchName' after the error above." -ForegroundColor Yellow
+            }
+            catch {
+                Write-Host "WARNING: could not automatically clean up compliance search '$SearchName' after the error above. Check its status manually: Get-ComplianceSearch -Identity '$SearchName'" -ForegroundColor Red
+            }
         }
         throw
     }
