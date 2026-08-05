@@ -1,6 +1,6 @@
 # pull-email.ps1
 
-**Current version: 1.1.0** (printed in the script's own startup banner - check that matches this file if in doubt which copy you're running).
+**Current version: 1.2.0** (printed in the script's own startup banner - check that matches this file if in doubt which copy you're running).
 
 Searches for a specific email (or a set of matching emails) across mailboxes and, after review, soft- or hard-deletes it.
 
@@ -58,6 +58,7 @@ The author accepts no responsibility for lost mail, broken environments, emergen
   * Received date range
 * Search-only preview mode
 * Soft Delete and Hard Delete support (where supported)
+* Full session transcript logged to disk automatically
 * Automatic RBAC permission validation
 * Query safety validation to prevent overly broad searches
 * Automatic detection and abort of runaway/unfiltered searches while they're still running
@@ -244,19 +245,23 @@ ComplianceSearch_<timestamp>_preview.txt
 
 For large result sets, the console displays a condensed summary while the preview file always contains the complete output and the raw compliance search payload.
 
+The entire console session is also transcribed automatically to:
+
+```
+ComplianceSearch_<timestamp>_log.txt
+```
+
+One log file per script *run*, not per search - if you use the "run another search?" loop, every search in that session lands in the same log. If logging can't start (permissions, already-transcribing session, etc.) the script prints a warning and continues without it rather than aborting the actual work. Both file patterns are already covered in `.gitignore`.
+
 ---
 
 # Message-ID behaviour
 
-### Exchange Online
-
-Uses native Message-ID searching via the Exchange Online compliance search engine. The angle brackets (`< >`) that surround a Message-ID as header syntax are stripped automatically before searching - they aren't part of the indexed value, and leaving them in causes the filter to silently fail to match (in testing, this turned a single-message search into an unfiltered scan of the entire tenant).
+Compliance search does not index message headers - Message-ID cannot be searched directly as a query filter in **either** on-premises Exchange or Exchange Online. An unrecognized `MessageId:` clause is silently dropped rather than erroring, which turns what looks like a single-message search into an unfiltered, organisation-wide scan instead (confirmed in testing: 90M+ items matched, 30-minute timeout, against a search meant to hit exactly one email). Because of this, a `-MessageID` search is **always** resolved to a sender + subject + date-window search before any compliance search is ever created - the script never trusts `MessageId:` as a real filter, in either environment.
 
 ### On-premises Exchange
 
-Because on-premises Exchange does not support Message-ID as a KQL property, the script automatically:
-
-1. Searches message tracking logs.
+1. Searches message tracking logs across all transport servers.
 2. Resolves the sender, subject and timestamp.
 3. Builds a narrow criteria search using a ±12-hour window.
 
@@ -265,6 +270,15 @@ Resolution will fail if:
 * the tracking logs no longer contain the message,
 * the message never traversed on-premises transport (for example, Exchange Online mailboxes in a hybrid deployment),
 * the Message-ID value itself is incorrect.
+
+### Exchange Online
+
+1. Runs a message trace (`Get-MessageTraceV2`, falling back to `Get-MessageTrace`) for the given Message-ID.
+2. Resolves the sender, subject and received timestamp from the earliest matching trace row.
+3. Builds a narrow criteria search using the same ±12-hour window.
+
+> [!NOTE]
+> Message trace cmdlets normally belong to a regular Exchange Online session (`Connect-ExchangeOnline`), not the Security & Compliance session (`Connect-IPPSSession`) this script connects with for everything else. As of this writing this hasn't been confirmed against a live tenant - if you hit a "command not found" error here, the session may need an additional `Connect-ExchangeOnline` alongside `Connect-IPPSSession`. In the meantime, resolve manually and re-run with `-SenderEmail`/`-Subject`/`-ReceivedDateTimeFrom`/`-ReceivedDateTimeTo` instead.
 
 ---
 

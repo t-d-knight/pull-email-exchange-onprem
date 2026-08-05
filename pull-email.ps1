@@ -49,7 +49,7 @@ param(
     [switch]$Force
 )
 
-$ScriptVersion = '1.1.0'
+$ScriptVersion = '1.2.0'
 
 $ErrorActionPreference = 'Stop'
 $VerbosePreference = 'Continue'
@@ -59,6 +59,12 @@ $MaxActionWaitSeconds = 1200 # 20 minutes
 $QueryTimeoutMinutes = 30
 $CmdDelaySeconds = 5
 
+# One log file per script *run* (not per search - a single session can run
+# several searches back to back via the "Run another search?" loop, and those
+# should all land in the same transcript rather than fragmenting across files).
+$ScriptRunTimestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+$LogFile = Join-Path $PSScriptRoot "ComplianceSearch_${ScriptRunTimestamp}_log.txt"
+
 # Overreach guardrail thresholds - above these, a "large impact" typed-token
 # confirmation is required instead of a plain yes/no (see Confirm-LargeImpact).
 $LargeImpactItemThreshold = 25
@@ -67,10 +73,11 @@ $LargeImpactMailboxThreshold = 10
 # Sanity ceiling for a search that's still running (see Wait-ComplianceSearch). This is
 # deliberately much higher than $LargeImpactItemThreshold above - a legitimate incident
 # search can plausibly match hundreds or low thousands of items. Above this many while
-# still InProgress, the query almost certainly isn't filtering as intended (e.g. an
-# unrecognized/malformed KQL clause got silently dropped, turning it into an unfiltered
-# org-wide scan) rather than genuinely needing that many results - abort early instead of
-# waiting out the full timeout while it keeps scanning.
+# still InProgress, the query almost certainly isn't filtering as intended rather than
+# genuinely needing that many results - abort early instead of waiting out the full
+# timeout while it keeps scanning. This is an independent backstop from the Message-ID
+# header-search fix below - it covers any search that goes broad for other reasons
+# (e.g. a resolved sender+subject combination that's more common than expected).
 $RunawaySearchItemCeiling = 50000
 
 # Above this many matched rows, the console preview switches from a full
@@ -79,12 +86,13 @@ $RunawaySearchItemCeiling = 50000
 # straight to the console).
 $PreviewDisplayLimit = 20
 
-# On-prem compliance search / Search-Mailbox have no "messageid" KQL property
-# (that field is Exchange Online-only) - a -MessageID search is resolved via
-# message tracking logs first (see Resolve-MessageIdToCriteria). These control
-# how far back to look, and how wide a date window to build around the result.
-# Not used at all when connected to Exchange Online (EXO) - messageid: works
-# there directly.
+# Compliance search can't filter on message headers (Message-ID) in EITHER
+# on-prem Exchange or Exchange Online, since headers aren't indexed for search.
+# A -MessageID search is always resolved first - via message tracking logs
+# on-prem (Resolve-MessageIdToCriteria) or message trace in EXO
+# (Resolve-MessageIdToCriteria-EXO) - into a sender+subject+date-window
+# search instead. These control how far back to look, and how wide a date
+# window to build around the resolved result.
 $MessageTrackingLookbackDays = 30
 $MessageIdDateWindowHours = 12
 
@@ -350,6 +358,78 @@ function Get-SearchCriteriaInteractive {
 }
 
 
+function Resolve-MessageIdToCriteria-EXO {
+    param(
+        [string]$MessageID
+    )
+
+    # IMPORTANT: compliance search / content search does NOT index message headers
+    # (Message-ID is a header field), and separately drops/ignores unindexed or
+    # unsupported query clauses rather than erroring - so a raw "(MessageId:"<...>")"
+    # ContentMatchQuery silently becomes an unfiltered, org-wide search instead of
+    # failing loudly. This bit us in production: a single-message search matched
+    # 90M+ items and timed out. Resolve via message trace first, the same way the
+    # on-prem branch resolves via message tracking logs, and build a real indexed
+    # (from/subject/received) query from that instead of trusting MessageId: at all.
+    Write-Host "`nCompliance search doesn't index message headers, so Message-ID can't be searched directly even in Exchange Online (an unrecognized 'MessageId:' clause is silently dropped rather than erroring, which turns this into an unfiltered org-wide search) - resolving this Message-ID via message trace first..." -ForegroundColor Yellow
+
+    # Message trace cmdlets belong to the regular Exchange Online management session
+    # (Connect-ExchangeOnline), not Security & Compliance PowerShell (Connect-IPPSSession,
+    # which is all Connect-ExchangeSession establishes for EXO). Untested as of writing
+    # whether IPPSSession happens to expose them too - fail fast with a clear next step
+    # instead of a confusing "command not found" buried inside the trace call below.
+    if (-not (Get-Command -Name Get-MessageTraceV2 -ErrorAction SilentlyContinue) -and
+        -not (Get-Command -Name Get-MessageTrace -ErrorAction SilentlyContinue)) {
+        Write-Error "Message trace cmdlets (Get-MessageTrace/Get-MessageTraceV2) aren't available in this session. Connect-IPPSSession alone may not expose them - you may also need Connect-ExchangeOnline in the same session. In the meantime, resolve manually and re-run with -SenderEmail/-Subject/-ReceivedDateTimeFrom/-ReceivedDateTimeTo instead."
+    }
+
+    $traceCmd = if (Get-Command -Name Get-MessageTraceV2 -ErrorAction SilentlyContinue) { 'Get-MessageTraceV2' } else { 'Get-MessageTrace' }
+    Write-Verbose "Using $traceCmd for message trace lookup."
+
+    $startDate = (Get-Date).AddDays(-$MessageTrackingLookbackDays)
+    $endDate = Get-Date
+
+    try {
+        $entries = @(& $traceCmd -MessageId $MessageID -StartDate $startDate -EndDate $endDate -ErrorAction Stop)
+    }
+    catch {
+        Write-Error "Message trace lookup ($traceCmd) failed for '$MessageID': $_"
+    }
+
+    if (-not $entries -or $entries.Count -eq 0) {
+        Write-Error "Could not resolve Message-ID '$MessageID' via $traceCmd (last $MessageTrackingLookbackDays day(s)). The message may be older than trace retention for this tenant, or the ID may be wrong. Identify the sender/subject/date manually and re-run with -SenderEmail/-Subject/-ReceivedDateTimeFrom/-ReceivedDateTimeTo instead."
+    }
+
+    # Multiple trace rows can come back for one message (one per recipient) - any of
+    # them carries the same sender/subject, so the earliest received timestamp anchors
+    # the narrowest accurate date window.
+    $entry = $entries | Sort-Object Received | Select-Object -First 1
+    $resolvedSender = $entry.SenderAddress
+    $resolvedSubject = $entry.Subject
+    $resolvedTimestamp = $entry.Received
+
+    if (-not $resolvedSender -or -not $resolvedTimestamp) {
+        Write-Error "Found a $traceCmd entry for '$MessageID' but it's missing sender/date detail. Identify the sender/subject/date manually and re-run with -SenderEmail/-Subject/-ReceivedDateTimeFrom/-ReceivedDateTimeTo instead."
+    }
+
+    $windowStart = $resolvedTimestamp.AddHours(-$MessageIdDateWindowHours).ToString('yyyy-MM-dd HH:mm:ss')
+    $windowEnd = $resolvedTimestamp.AddHours($MessageIdDateWindowHours).ToString('yyyy-MM-dd HH:mm:ss')
+
+    Write-Host "Resolved via ${traceCmd}:" -ForegroundColor Green
+    Write-Host "  Sender   : $resolvedSender"
+    Write-Host "  Subject  : $resolvedSubject"
+    Write-Host "  Traced at: $resolvedTimestamp"
+    Write-Host "Narrowing the search to this sender + subject + a $($MessageIdDateWindowHours * 2)-hour window around that timestamp.`n" -ForegroundColor Green
+
+    return [pscustomobject]@{
+        SenderEmail          = $resolvedSender
+        Subject              = $resolvedSubject
+        ReceivedDateTimeFrom = $windowStart
+        ReceivedDateTimeTo   = $windowEnd
+    }
+}
+
+
 function Resolve-MessageIdToCriteria {
     param(
         [string]$MessageID
@@ -464,13 +544,16 @@ function New-ComplianceSearchQuery {
     $BodyContains = if ($BodyContains) { $BodyContains.Trim() } else { $BodyContains }
 
     if ($MessageID) {
-        # Message-ID search (most specific). The angle brackets that RFC 5322 headers (and
-        # most mail clients/tools) display around a Message-ID are delimiter syntax, not
-        # part of the indexed value - leaving them in makes the messageid:"..." clause fail
-        # to match as a filter, and the search silently falls back to matching everything
-        # instead of erroring (seen live: a single-message search returned 95M+ "items found").
-        $cleanMessageId = $MessageID.TrimStart('<').TrimEnd('>')
-        $queryParts += "(MessageId:""$cleanMessageId"")"
+        # Compliance search does not index message headers in EITHER on-prem Exchange
+        # or Exchange Online - a raw "MessageId:" clause is not a real indexed filter
+        # and gets silently dropped rather than erroring, which turns this into an
+        # unfiltered org-wide search (confirmed in production: 90M+ items, 30-minute
+        # timeout, against a single-message search). MessageID is resolved to
+        # sender+subject+date-window criteria upstream (Resolve-MessageIdToCriteria /
+        # Resolve-MessageIdToCriteria-EXO) before this function is ever called with a
+        # MessageID value - this branch should be unreachable. It's kept only as a loud
+        # failure rather than a silent no-op, in case that resolution step is bypassed.
+        Write-Error "Internal error: New-ComplianceSearchQuery was called with -MessageID set. Message-ID must be resolved to sender/subject/date criteria before reaching the query builder - compliance search cannot filter on message headers directly in any environment."
     }
     else {
         # Criteria-based search
@@ -555,13 +638,12 @@ function Wait-ComplianceSearch {
             Write-Host "  Searching... Status: $status, Items found so far: $($search.Items)" -ForegroundColor Yellow
 
             # A search still climbing well past any plausible legitimate result count almost
-            # certainly means the query isn't filtering as intended (e.g. an unrecognized/
-            # malformed KQL clause was silently dropped, turning it into an unfiltered
-            # org-wide scan) rather than genuinely needing that many results. Stop it and
-            # abort now instead of waiting out the full timeout while it keeps scanning.
+            # certainly means the query isn't filtering as intended rather than genuinely
+            # needing that many results. Stop it and abort now instead of waiting out the
+            # full timeout while it keeps scanning.
             if ($RunawayItemCeiling -gt 0 -and $search.Items -gt $RunawayItemCeiling) {
                 try { Stop-ComplianceSearch -Identity $Identity -Confirm:$false -ErrorAction Stop } catch { }
-                Write-Error "Search '$Identity' has matched $($search.Items) item(s) while still running - far beyond what a legitimate targeted search should return. Aborting: the query almost certainly isn't filtering as intended (check for a malformed/unsupported KQL clause, e.g. a Message-ID with its angle brackets still attached). The search has been stopped."
+                Write-Error "Search '$Identity' has matched $($search.Items) item(s) while still running - far beyond what a legitimate targeted search should return. Aborting: the query almost certainly isn't filtering as intended. The search has been stopped."
             }
 
             Start-Sleep -Seconds $checkInterval
@@ -755,7 +837,18 @@ function Invoke-EmailSearchAndDelete {
         }
 
         if ($effectiveParameterSetName -eq 'MessageID' -and $IsEXO) {
-            Write-Host "`nExchange Online supports Message-ID search directly - searching for exactly this message." -ForegroundColor Green
+            # NOTE: compliance search does not index message headers in Exchange Online
+            # either - Message-ID can't be searched directly. Resolve via message trace
+            # into a sender+subject+date-window search, same shape as the on-prem path.
+            $resolved = Resolve-MessageIdToCriteria-EXO -MessageID $qMessageID
+            $effectiveParameterSetName = 'Criteria'
+            $qMessageID = $null
+            $qSenderEmail = $resolved.SenderEmail
+            $qRecipientEmail = $null
+            $qSubject = $resolved.Subject
+            $qBodyContains = $null
+            $qReceivedDateTimeFrom = $resolved.ReceivedDateTimeFrom
+            $qReceivedDateTimeTo = $resolved.ReceivedDateTimeTo
         }
         elseif ($effectiveParameterSetName -eq 'MessageID') {
             # Neither on-prem compliance search nor Search-Mailbox support querying by
@@ -1013,9 +1106,7 @@ function Invoke-EmailSearchAndDelete {
             # Best-effort cleanup after a failed/aborted search. Stop first, in case it's
             # still actively running (e.g. the runaway-item abort above) - Remove-ComplianceSearch
             # isn't guaranteed to tear down a search that's still InProgress. Report whether
-            # this actually worked instead of swallowing the result either way - the whole point
-            # of getting fixed was that a failed cleanup here previously looked identical to a
-            # successful one.
+            # this actually worked instead of swallowing the result either way.
             try { Stop-ComplianceSearch -Identity $SearchName -Confirm:$false -ErrorAction SilentlyContinue } catch { }
             try {
                 Remove-ComplianceSearch -Identity $SearchName -Confirm:$false -ErrorAction Stop
@@ -1035,6 +1126,19 @@ $SearchMode = $null
 $IsEXO = $false
 
 try {
+    # Start a transcript for this run so the whole session (console output,
+    # Write-Host, and errors as they're hit) is captured to disk for later
+    # review, independent of the per-search preview files above. Wrapped so a
+    # transcript failure (permissions, already-transcribing, etc.) is a
+    # warning, not a reason to abort the actual work.
+    try {
+        Start-Transcript -Path $LogFile -Append -ErrorAction Stop | Out-Null
+        Write-Host "Logging this session to: $LogFile" -ForegroundColor DarkGray
+    }
+    catch {
+        Write-Host "WARNING: Could not start transcript logging ($_). Continuing without a log file." -ForegroundColor Yellow
+    }
+
     Write-Host "======================================" -ForegroundColor Cyan
     Write-Host "Exchange Compliance Search & Delete (v$ScriptVersion)" -ForegroundColor Cyan
     if ($SearchOnly) { Write-Host "MODE: SEARCH ONLY - no delete action will run" -ForegroundColor Green }
@@ -1094,4 +1198,7 @@ finally {
         Remove-PSSession $Session -ErrorAction SilentlyContinue
     }
     $global:VerbosePreference = $previousVerbosePreference
+
+    # Stop-Transcript last, so it also captures the disconnect/cleanup messages above.
+    try { Stop-Transcript -ErrorAction SilentlyContinue | Out-Null } catch { }
 }
