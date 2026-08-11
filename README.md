@@ -1,6 +1,6 @@
 # pull-email.ps1
 
-**Current version: 1.2.0** (printed in the script's own startup banner - check that matches this file if in doubt which copy you're running).
+**Current version: 1.4.0** (printed in the script's own startup banner - check that matches this file if in doubt which copy you're running).
 
 Searches for a specific email (or a set of matching emails) across mailboxes and, after review, soft- or hard-deletes it.
 
@@ -60,18 +60,20 @@ The author accepts no responsibility for lost mail, broken environments, emergen
 * Soft Delete and Hard Delete support (where supported)
 * Full session transcript logged to disk automatically
 * Automatic RBAC permission validation
-* Query safety validation to prevent overly broad searches
-* Automatic detection and abort of runaway/unfiltered searches while they're still running
+* Proactive warning if the executing account lacks an on-prem mailbox (see [Known gaps](#known-gaps))
+* Query safety validation to prevent overly broad criteria-based searches
+* Automatic abort of a search that's still running once it crosses a runaway-item threshold, rather than left to run to timeout
 * Preview matched items before deletion
 * Large-impact confirmation safeguards
 * Reuses the existing Exchange session for multiple searches without reconnecting
+* Optional, opt-in check for a newer version on first run (`-CheckForUpdates`) - never auto-downloads, just tells you and links to the repo
 
 ---
 
 # Compatibility
 
 | Platform                  | Support                        |
-| ------------------------- | ------------------------------ |
+| ------------------------- | ------------------------------- |
 | Exchange Online           | Fully supported                |
 | Exchange Server 2019      | Modern mode                    |
 | Exchange Server 2016 CU7+ | Modern mode                    |
@@ -89,6 +91,7 @@ The script does **not** rely on Exchange version detection. Instead, it detects 
 * Windows PowerShell 5.1 is recommended (matches Exchange Management Shell compatibility).
 * PowerShell 7+ works for the Exchange Online path but has not been extensively tested against on-premises remote PowerShell.
 * An Exchange account with the required RBAC role assignments (see **Permissions** below).
+* **On-premises only:** the account also needs its own on-prem mailbox - see [Known gaps](#known-gaps) for why.
 
 The script validates permissions before beginning any search and will fail immediately with guidance if required roles are missing.
 
@@ -117,7 +120,7 @@ Install the Exchange Online Management module, **version 3.9.0 or later** (neede
 Install-Module ExchangeOnlineManagement -Scope CurrentUser
 ```
 
-Authentication uses **Microsoft Modern Authentication**, including MFA and Conditional Access policies.
+Authentication uses **Microsoft Modern Authentication**, including MFA and Conditional Access policies. The script opens **two** sessions under the hood for EXO: the Security & Compliance session (`Connect-IPPSSession`, for the actual search/delete cmdlets) and a second, narrowly-scoped `Connect-ExchangeOnline` session limited to just the message-trace cmdlets (`Get-MessageTrace`/`Get-MessageTraceV2`/etc., used only to resolve `-MessageID` searches - see below). Expect an auth prompt, or a silent token reuse, for each.
 
 ---
 
@@ -126,9 +129,9 @@ Authentication uses **Microsoft Modern Authentication**, including MFA and Condi
 The connecting account requires Exchange RBAC roles appropriate for the requested operation.
 
 | Operation | On-premises                                 | Exchange Online     |
-| --------- | ------------------------------------------- | ------------------- |
-| Search    | `Mailbox Search` and/or `Compliance Search` | `Compliance Search` |
-| Delete    | `Mailbox Import Export` (Legacy mode only)  | `Search And Purge`  |
+| --------- | ------------------------------------------- | -------------------- |
+| Search    | `Mailbox Search` and/or `Compliance Search` | `Compliance Search`  |
+| Delete    | `Mailbox Import Export` (Legacy mode only)  | `Search And Purge`   |
 
 In most environments this is achieved by membership of:
 
@@ -142,6 +145,9 @@ portal, not this session - so for EXO the script instead does a basic capability
 (`Get-ComplianceSearch -ResultSize 1`) to confirm the account can at least reach compliance
 search. This does not confirm the `Search And Purge` role specifically; if a delete action
 fails with an authorization error, check for that role in the Purview compliance portal.
+
+**Note:** more RBAC roles is not always better. An over-provisioned on-prem admin account can
+fail in ways a normally-scoped account won't - see [Known gaps](#known-gaps).
 
 ---
 
@@ -205,7 +211,7 @@ After completing a search, the script offers to perform additional searches usin
 # Parameters
 
 | Parameter                                       | Description                                                                            |
-| ----------------------------------------------- | -------------------------------------------------------------------------------------- |
+| ------------------------------------------------ | ---------------------------------------------------------------------------------------- |
 | `-Server`                                       | Exchange server FQDN or `EXO`.                                                         |
 | `-Credential`                                   | PSCredential for on-premises Exchange. Ignored for EXO except to pre-populate the UPN. |
 | `-UseSSL`                                       | Uses HTTPS instead of HTTP for the remote PowerShell endpoint.                         |
@@ -217,6 +223,7 @@ After completing a search, the script offers to perform additional searches usin
 | `-ReceivedDateTimeFrom` / `-ReceivedDateTimeTo` | Date range (`yyyy-MM-dd` or `yyyy-MM-dd HH:mm:ss`), interpreted in the local machine's time zone. A date given without a time (e.g. just `2026-07-26`) is treated as the start of that day for `-From` and the *end* of that day for `-To` - so the same date on both ends covers the whole day, not a single instant. The resolved range is echoed back in local time before the search runs so you can confirm it matches what you expect. |
 | `-DeleteType`                                   | `Soft` (default) or `Hard`. Hard Delete is Exchange Online only.                       |
 | `-SearchOnly`                                   | Preview results without deleting anything.                                             |
+| `-CheckForUpdates`                              | Opt-in only. Compares the running version against the copy at [github.com/t-d-knight/pull-email-exchange-onprem](https://github.com/t-d-knight/pull-email-exchange-onprem) (`$UpdateCheckUrl`, already pointed at this repo's `main` branch) and prints a one-line notice if newer is available. Never downloads or replaces anything. 3-second timeout, fails completely silently on any error (no internet, proxy, GitHub down, etc.) - can never block or fail an actual run. |
 | `-Force`                                        | Skips standard confirmation prompts.                                                   |
 
 ---
@@ -226,11 +233,12 @@ After completing a search, the script offers to perform additional searches usin
 Because the script searches the entire organisation, several safeguards are built in.
 
 * Criteria-based searches must specify both **who** (sender and/or recipient) and **what/when** (subject, body text, or date range).
-* Message-ID searches are exempt, as they are already highly specific.
+* Message-ID searches are exempt, as they are already highly specific - see [Message-ID behaviour](#message-id-behaviour) for why they still can't be trusted as a raw filter.
 * Every delete operation is preceded by a preview.
 * Large-impact operations (more than 25 items or 10 mailboxes) require typing a randomly generated confirmation token.
 * Hard Delete operations always require the large-impact confirmation.
 * Required RBAC permissions are validated before any search begins.
+* The executing account is checked for an on-prem mailbox before any search begins (warning only, not a hard block - see [Known gaps](#known-gaps)).
 * **Runaway-search abort**: while a search is still running, if it's already matched more than 50,000 items it's stopped and aborted automatically rather than left to run out its full timeout - that many matches almost always means a malformed or unsupported query clause silently turned into an unfiltered, organisation-wide scan rather than a genuine result set.
 
 ---
@@ -251,13 +259,13 @@ The entire console session is also transcribed automatically to:
 ComplianceSearch_<timestamp>_log.txt
 ```
 
-One log file per script *run*, not per search - if you use the "run another search?" loop, every search in that session lands in the same log. If logging can't start (permissions, already-transcribing session, etc.) the script prints a warning and continues without it rather than aborting the actual work. Both file patterns are already covered in `.gitignore`.
+One log file per script *run*, not per search - if you use the "run another search?" loop, every search in that session lands in the same log. If logging can't start (permissions, already-transcribing session, etc.) the script prints a warning and continues without it rather than aborting the actual work.
 
 ---
 
 # Message-ID behaviour
 
-Compliance search does not index message headers - Message-ID cannot be searched directly as a query filter in **either** on-premises Exchange or Exchange Online. An unrecognized `MessageId:` clause is silently dropped rather than erroring, which turns what looks like a single-message search into an unfiltered, organisation-wide scan instead (confirmed in testing: 90M+ items matched, 30-minute timeout, against a search meant to hit exactly one email). Because of this, a `-MessageID` search is **always** resolved to a sender + subject + date-window search before any compliance search is ever created - the script never trusts `MessageId:` as a real filter, in either environment.
+Compliance search does not index message headers - Message-ID cannot be searched directly as a query filter in **either** on-premises Exchange or Exchange Online. An unrecognized `MessageId:` clause is silently dropped rather than erroring, which turns what looks like a single-message search into an unfiltered, organisation-wide scan instead (confirmed in production: 90M+ items matched, 30-minute timeout, against a search meant to hit exactly one email). Because of this, a `-MessageID` search is **always** resolved to a sender + subject + date-window search before any compliance search is ever created - the script never trusts `MessageId:` as a real filter, in either environment.
 
 ### On-premises Exchange
 
@@ -277,8 +285,7 @@ Resolution will fail if:
 2. Resolves the sender, subject and received timestamp from the earliest matching trace row.
 3. Builds a narrow criteria search using the same ±12-hour window.
 
-> [!NOTE]
-> Message trace cmdlets normally belong to a regular Exchange Online session (`Connect-ExchangeOnline`), not the Security & Compliance session (`Connect-IPPSSession`) this script connects with for everything else. As of this writing this hasn't been confirmed against a live tenant - if you hit a "command not found" error here, the session may need an additional `Connect-ExchangeOnline` alongside `Connect-IPPSSession`. In the meantime, resolve manually and re-run with `-SenderEmail`/`-Subject`/`-ReceivedDateTimeFrom`/`-ReceivedDateTimeTo` instead.
+This requires the second, message-trace-only `Connect-ExchangeOnline` session mentioned under **Prerequisites > Exchange Online** above - `Connect-IPPSSession` alone does not expose these cmdlets. Confirmed working as of v1.3.0.
 
 ---
 
@@ -295,7 +302,7 @@ Legacy mode uses `Search-Mailbox`, which has several inherent limitations:
 
 # Cleanup behaviour
 
-Compliance searches created during normal operation are automatically removed after completion. On a failure or an abort (including the runaway-search abort above), the script stops the search first - in case it's still actively running, which can prevent a straight removal - then removes it, and explicitly tells you whether that cleanup actually succeeded. If cleanup fails, you'll see a clear warning telling you to check its status manually rather than the script silently leaving it behind.
+Compliance searches created during normal operation are removed automatically after completion. On a failure or an abort (including the runaway-search abort above), the script stops the search first - in case it's still actively running, which can prevent a straight removal - then removes it, and explicitly tells you whether that cleanup actually succeeded. If cleanup fails, you'll see a clear warning telling you to check its status manually rather than the script silently leaving it behind. If the search was never actually created (e.g. Message-ID resolution failed before `New-ComplianceSearch` ran), the script correctly skips the cleanup attempt entirely rather than throwing a confusing secondary error about a search that doesn't exist (fixed in v1.3.0).
 
 When `-SearchOnly` is used, compliance searches are intentionally left in place so administrators can inspect them before manual cleanup.
 
@@ -313,6 +320,18 @@ It does **not**:
 * modify transport rules
 * perform Purview eDiscovery exports
 * modify Defender for Office 365 policies
+
+---
+
+# Known gaps
+
+Honest list of things this script currently does **not** do, despite being the kind of thing you'd want in an incident-response tool. Not hidden in a changelog - called out here on purpose.
+
+* **"Failed to retrieve executing user" has two unrelated causes that look identical**, both confirmed in production against different on-prem orgs:
+  1. The org-wide Discovery/arbitration mailbox (`SystemMailbox{e0dc1c29-89c3-4034-b678-e6c29d823ed9}`) is missing or broken - fails for *every* account on that org. Fix: `Setup.exe /PrepareAD` (change-window territory).
+  2. The executing account has no on-prem mailbox - fails for *that account only*, regardless of RBAC roles held (confirmed: an account with Organization Management still failed while a normally-scoped account on the same server succeeded). Fix: use or provision an account with a mailbox.
+
+  The script warns about cause #2 at connect time (Step 0d) but can't detect cause #1 in advance - if the warning doesn't fire and you still hit this error, check whether it's account-specific (try a second account on the same server) before reaching for `/PrepareAD`.
 
 ---
 

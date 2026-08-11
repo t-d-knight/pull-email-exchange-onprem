@@ -46,10 +46,40 @@ param(
     # to bypass. Use this every time you're not 100% sure of the query yet.
     [switch]$SearchOnly,
 
+    # Opt-in only - see Test-ScriptVersionCurrent for why this is never on by
+    # default. Compares $ScriptVersion below against whatever's on $UpdateCheckUrl
+    # and prints a one-line notice (never blocks, never downloads/replaces
+    # anything) if what you're running is behind.
+    [switch]$CheckForUpdates,
+
     [switch]$Force
 )
 
-$ScriptVersion = '1.2.0'
+# EDIT BEFORE USE: point this at the raw file URL for wherever this script is
+# actually hosted, e.g.:
+#   https://raw.githubusercontent.com/<org-or-user>/<repo>/main/pull-email.ps1
+# Left as an obvious placeholder rather than a guessed real-looking URL, so a
+# silent failure here can't be mistaken for "checked, nothing newer" when it
+# actually never reached anything.
+$UpdateCheckUrl = 'https://raw.githubusercontent.com/t-d-knight/pull-email-exchange-onprem/main/pull-email.ps1'
+$UpdateCheckTimeoutSeconds = 3
+
+$ScriptVersion = '1.4.0'
+
+# KNOWN ISSUES / TROUBLESHOOTING NOTES
+# -------------------------------------
+# "Unable to execute the task. Reason: Failed to retrieve executing user."
+# (on New-ComplianceSearch/Start-ComplianceSearch/Get-ComplianceSearch, on-prem
+# only) has TWO unrelated causes that present identically. See the full
+# writeup on Test-ExecutingUserMailbox below before assuming either one:
+#   1. Missing/broken org-wide Discovery mailbox
+#      (SystemMailbox{e0dc1c29-89c3-4034-b678-e6c29d823ed9}) - fails for
+#      EVERY account on that org. Fix: Setup.exe /PrepareAD (change window).
+#   2. Executing account has no on-prem mailbox - fails for THAT account only,
+#      regardless of RBAC roles held. Fix: use/provision an account with a
+#      mailbox. This script now warns about this at connect time (Step 0d).
+# Diagnostic shortcut: if it fails for one account but not another on the same
+# server, it's #2, not #1 - don't reach for /PrepareAD first.
 
 $ErrorActionPreference = 'Stop'
 $VerbosePreference = 'Continue'
@@ -70,15 +100,18 @@ $LogFile = Join-Path $PSScriptRoot "ComplianceSearch_${ScriptRunTimestamp}_log.t
 $LargeImpactItemThreshold = 25
 $LargeImpactMailboxThreshold = 10
 
-# Sanity ceiling for a search that's still running (see Wait-ComplianceSearch). This is
-# deliberately much higher than $LargeImpactItemThreshold above - a legitimate incident
-# search can plausibly match hundreds or low thousands of items. Above this many while
-# still InProgress, the query almost certainly isn't filtering as intended rather than
-# genuinely needing that many results - abort early instead of waiting out the full
-# timeout while it keeps scanning. This is an independent backstop from the Message-ID
-# header-search fix below - it covers any search that goes broad for other reasons
-# (e.g. a resolved sender+subject combination that's more common than expected).
-$RunawaySearchItemCeiling = 50000
+# Above this many matched items WHILE A SEARCH IS STILL RUNNING, the search is
+# stopped and aborted automatically rather than left to run to its full
+# timeout - see Wait-ComplianceSearch. This is a much higher bar than
+# $LargeImpactItemThreshold on purpose: that one gates a legitimate large but
+# intentional delete: this one exists purely to catch a query that's silently
+# degraded into an unfiltered org-wide scan (confirmed possible: 90M+ items,
+# 30-minute timeout, against a search meant to hit exactly one email - see the
+# Message-ID header-indexing note on New-ComplianceSearchQuery). 50,000 is
+# comfortably above any legitimate single-incident cleanup for this org size,
+# and comfortably below where a runaway scan lands within the first minute or
+# two of polling.
+$RunawaySearchItemThreshold = 50000
 
 # Above this many matched rows, the console preview switches from a full
 # per-item listing to a condensed sender+subject summary (full detail always
@@ -95,6 +128,56 @@ $PreviewDisplayLimit = 20
 # window to build around the resolved result.
 $MessageTrackingLookbackDays = 30
 $MessageIdDateWindowHours = 12
+
+
+function Test-ScriptVersionCurrent {
+    param(
+        [string]$CurrentVersion,
+        [string]$Url,
+        [int]$TimeoutSeconds = 3
+    )
+
+    # Opt-in (-CheckForUpdates) and best-effort by design, not just by
+    # accident - the direct reason this exists: a colleague ran a copy dated
+    # the 30th while a run of real fixes landed in the days after (transcript
+    # logging, the EXO Message-ID/header-indexing bug, the on-prem mailbox
+    # preflight, the runaway-search abort...). A one-line "you're behind, here's
+    # the link" would have saved that confusion. It does NOT auto-download or
+    # replace anything - see the README on why: silently running whatever's
+    # currently on main is the exact thing this project's own disclaimer tells
+    # people not to do, doubly so for a tool that deletes mail org-wide.
+    #
+    # Every failure mode here (no internet, DNS, proxy, GitHub down, placeholder
+    # URL never edited, regex miss because the upstream file's format changed)
+    # must degrade to complete silence - this can NEVER be allowed to block,
+    # slow down, or fail an actual incident-response run over a version check.
+    if ($Url -match 'CHANGEME') {
+        return
+    }
+
+    try {
+        $response = Invoke-WebRequest -Uri $Url -TimeoutSec $TimeoutSeconds -UseBasicParsing -ErrorAction Stop
+
+        if ($response.Content -notmatch "`$ScriptVersion\s*=\s*'([\d.]+)'") {
+            return
+        }
+        $remoteVersionString = $Matches[1]
+
+        $current = [version]$CurrentVersion
+        $remote = [version]$remoteVersionString
+
+        if ($remote -gt $current) {
+            Write-Host "`nNOTE: You're running v$CurrentVersion - v$remoteVersionString is available." -ForegroundColor Yellow
+            Write-Host "  $Url" -ForegroundColor Yellow
+            Write-Host "  (Not downloaded automatically - review changes before updating, same as you would for any script that touches production mail.)`n" -ForegroundColor DarkGray
+        }
+    }
+    catch {
+        # Deliberately silent - see comment above. Uncomment the line below only
+        # for local troubleshooting of the check itself, never leave it on:
+        # Write-Verbose "Update check failed (non-fatal): $_"
+    }
+}
 
 
 function Connect-ExchangeSession {
@@ -136,6 +219,16 @@ function Connect-ExchangeSession {
             # fails with "Please close the current session and open a new session using
             # Connect-IPPSSession with the -EnableSearchOnlySession flag."
             Connect-IPPSSession -UserPrincipalName $upn -EnableSearchOnlySession -WarningAction SilentlyContinue -ErrorAction Stop
+
+            # Connect-IPPSSession (Security & Compliance PowerShell) does NOT expose
+            # Get-MessageTrace/Get-MessageTraceV2 - those live in the regular Exchange
+            # Online management session (Connect-ExchangeOnline), which is a different
+            # backend entirely. They're needed to resolve a -MessageID search (see
+            # Resolve-MessageIdToCriteria-EXO), since compliance search can't filter on
+            # message headers directly. -CommandName restricts what gets imported to just
+            # the trace cmdlets, so this session doesn't clobber any Compliance-session
+            # cmdlets of the same name (e.g. Get-Recipient exists in both modules).
+            Connect-ExchangeOnline -UserPrincipalName $upn -CommandName 'Get-MessageTrace', 'Get-MessageTraceV2', 'Get-MessageTraceDetail', 'Get-MessageTraceDetailV2' -ShowBanner:$false -WarningAction SilentlyContinue -ErrorAction Stop
         }
         finally {
             $global:VerbosePreference = $previousVerbosePreference
@@ -288,6 +381,85 @@ function Test-RequiredPermissions {
 }
 
 
+function Test-ExecutingUserMailbox {
+    param(
+        [string]$AccountName,
+        [switch]$IsEXO
+    )
+
+    # BACKGROUND (do not remove without re-reading this): "Unable to execute the
+    # task. Reason: Failed to retrieve executing user. Please try again later."
+    # thrown by New-ComplianceSearch/Start-ComplianceSearch/Get-ComplianceSearch
+    # has TWO distinct, unrelated root causes we've now hit in production, and
+    # they present IDENTICALLY - same error text, same immediate/every-call
+    # failure pattern - so don't assume it's the same one twice:
+    #
+    #   1. The org-wide Discovery/arbitration system mailbox
+    #      (SystemMailbox{e0dc1c29-89c3-4034-b678-e6c29d823ed9}) is missing or
+    #      broken. This breaks the error for EVERY account on that org, no
+    #      exceptions - confirmed at Kerhosp. Fix is Setup.exe /PrepareAD
+    #      (org-wide, change-window territory, not a quick fix).
+    #
+    #   2. The EXECUTING account itself has no on-prem mailbox. This is
+    #      per-account, not org-wide - confirmed at Swan Hill, where the same
+    #      cmdlet against the same server on the same day failed for one admin
+    #      account and succeeded cleanly for another. If cause #1 were in play
+    #      it would have failed for both. RBAC role count is NOT the
+    #      differentiator either - the failing account there had Organization
+    #      Management (effectively every role available) and still failed
+    #      identically to a standard analyst account elsewhere failing under
+    #      cause #1. This matches how a lot of tiered-admin naming conventions
+    #      (_adm/.admin suffixed accounts) work: deliberately not mail-enabled,
+    #      as a security posture, which is fine for almost everything BUT this.
+    #
+    # Diagnostic order when this error shows up on-prem: check whether it's
+    # account-specific first (does it fail for other accounts on the same
+    # server?) before chasing the org-wide arbitration mailbox - that saves a
+    # /PrepareAD detour when the real fix is "use/provision an account with a
+    # mailbox" instead.
+    #
+    # This check is a WARNING, not a hard block: it's a strong correlation from
+    # two real incidents, not a documented Microsoft requirement (their own
+    # guidance for Exchange Online content search explicitly says a mailbox is
+    # NOT required there - this appears to be on-prem-specific, and even there
+    # we have an n=1 confirmed case, not exhaustive proof). Blocking a valid
+    # run on a hypothesis this specific would be worse than an occasional
+    # false-negative warning.
+
+    if ($IsEXO) {
+        # Documented as not required for Exchange Online content search - skip.
+        return
+    }
+
+    if (-not (Get-Command -Name Get-Mailbox -ErrorAction SilentlyContinue)) {
+        return
+    }
+
+    Write-Host "Checking '$AccountName' has an on-prem mailbox (known correlate of 'Failed to retrieve executing user')..." -ForegroundColor Cyan
+
+    $mbx = Get-Mailbox -Identity $AccountName -ErrorAction SilentlyContinue
+
+    if (-not $mbx) {
+        Write-Host @"
+WARNING: '$AccountName' does not appear to have an on-prem mailbox.
+
+If New-ComplianceSearch / Start-ComplianceSearch / Get-ComplianceSearch fail
+below with "Failed to retrieve executing user", this is now a two-time-confirmed
+correlate (Swan Hill, 2026-08) - the SAME error also has an unrelated org-wide
+cause (missing Discovery/arbitration mailbox), so don't assume this is it
+without checking whether the failure is account-specific first.
+
+If it does fail this way: re-run as, or ask whoever holds the search to run as,
+an account that DOES have a mailbox - RBAC roles alone (even Organization
+Management) do not work around this.
+"@ -ForegroundColor Yellow
+    }
+    else {
+        Write-Host "  '$AccountName' has a mailbox ($($mbx.PrimarySmtpAddress)) - not a likely cause if 'Failed to retrieve executing user' shows up." -ForegroundColor DarkGray
+    }
+}
+
+
 function Get-SearchCriteriaInteractive {
     Write-Host "`nNo search criteria were supplied on the command line - let's build one interactively." -ForegroundColor Cyan
     Write-Host "  1) Message-ID (most specific - use this whenever you have it)"
@@ -372,16 +544,6 @@ function Resolve-MessageIdToCriteria-EXO {
     # on-prem branch resolves via message tracking logs, and build a real indexed
     # (from/subject/received) query from that instead of trusting MessageId: at all.
     Write-Host "`nCompliance search doesn't index message headers, so Message-ID can't be searched directly even in Exchange Online (an unrecognized 'MessageId:' clause is silently dropped rather than erroring, which turns this into an unfiltered org-wide search) - resolving this Message-ID via message trace first..." -ForegroundColor Yellow
-
-    # Message trace cmdlets belong to the regular Exchange Online management session
-    # (Connect-ExchangeOnline), not Security & Compliance PowerShell (Connect-IPPSSession,
-    # which is all Connect-ExchangeSession establishes for EXO). Untested as of writing
-    # whether IPPSSession happens to expose them too - fail fast with a clear next step
-    # instead of a confusing "command not found" buried inside the trace call below.
-    if (-not (Get-Command -Name Get-MessageTraceV2 -ErrorAction SilentlyContinue) -and
-        -not (Get-Command -Name Get-MessageTrace -ErrorAction SilentlyContinue)) {
-        Write-Error "Message trace cmdlets (Get-MessageTrace/Get-MessageTraceV2) aren't available in this session. Connect-IPPSSession alone may not expose them - you may also need Connect-ExchangeOnline in the same session. In the meantime, resolve manually and re-run with -SenderEmail/-Subject/-ReceivedDateTimeFrom/-ReceivedDateTimeTo instead."
-    }
 
     $traceCmd = if (Get-Command -Name Get-MessageTraceV2 -ErrorAction SilentlyContinue) { 'Get-MessageTraceV2' } else { 'Get-MessageTrace' }
     Write-Verbose "Using $traceCmd for message trace lookup."
@@ -610,11 +772,45 @@ function New-ComplianceSearchQuery {
 }
 
 
+function Remove-ComplianceSearchWithReport {
+    param(
+        [string]$Identity
+    )
+
+    # Used on the error/abort cleanup path (the success path's own
+    # Remove-ComplianceSearch calls elsewhere don't need this - the search is
+    # already Completed by the time those run, so there's nothing to stop).
+    # A search that's still actively running (InProgress/Starting) can't
+    # always be removed cleanly in one step, hence stop-first. Both steps are
+    # best-effort - a failed cleanup here means the underlying operation
+    # already failed too, and this function's job is to report what happened,
+    # not to throw a second error on top of the first.
+    $stopSucceeded = $true
+    try {
+        $current = Get-ComplianceSearch -Identity $Identity -ErrorAction Stop
+        if ($current.Status -notin @('Completed', 'Stopped')) {
+            Stop-ComplianceSearch -Identity $Identity -Confirm:$false -ErrorAction Stop
+        }
+    }
+    catch {
+        $stopSucceeded = $false
+    }
+
+    try {
+        Remove-ComplianceSearch -Identity $Identity -Confirm:$false -ErrorAction Stop
+        Write-Host "Cleanup: compliance search '$Identity' removed successfully." -ForegroundColor DarkGray
+    }
+    catch {
+        Write-Host "WARNING: cleanup FAILED - could not remove compliance search '$Identity'$(if (-not $stopSucceeded) { ' (stop-first step also failed)' }). Check its status manually: Get-ComplianceSearch -Identity '$Identity'. Details: $_" -ForegroundColor Red
+    }
+}
+
+
 function Wait-ComplianceSearch {
     param(
         [string]$Identity,
         [int]$TimeoutSeconds = 600,
-        [int]$RunawayItemCeiling = 0
+        [int]$RunawayItemThreshold = $RunawaySearchItemThreshold
     )
 
     $elapsed = 0
@@ -635,17 +831,26 @@ function Wait-ComplianceSearch {
             Write-Error "Search was stopped."
         }
         else {
-            Write-Host "  Searching... Status: $status, Items found so far: $($search.Items)" -ForegroundColor Yellow
-
-            # A search still climbing well past any plausible legitimate result count almost
-            # certainly means the query isn't filtering as intended rather than genuinely
-            # needing that many results. Stop it and abort now instead of waiting out the
-            # full timeout while it keeps scanning.
-            if ($RunawayItemCeiling -gt 0 -and $search.Items -gt $RunawayItemCeiling) {
-                try { Stop-ComplianceSearch -Identity $Identity -Confirm:$false -ErrorAction Stop } catch { }
-                Write-Error "Search '$Identity' has matched $($search.Items) item(s) while still running - far beyond what a legitimate targeted search should return. Aborting: the query almost certainly isn't filtering as intended. The search has been stopped."
+            # Runaway-search abort: a query that's silently lost its filter (see
+            # the Message-ID header-indexing note elsewhere in this file) looks
+            # exactly like this while it's running - status InProgress, item
+            # count climbing fast, well past what any legitimate single-message
+            # or single-incident search should ever match. Bail out here rather
+            # than let it run the full timeout, since by the time the timeout
+            # fires the query has usually already walked most of the org anyway.
+            if ($search.Items -gt $RunawayItemThreshold) {
+                Write-Host "  Item count ($($search.Items)) has crossed the runaway-search threshold ($RunawayItemThreshold) while still $status - stopping the search now rather than letting it run to timeout." -ForegroundColor Red
+                try {
+                    Stop-ComplianceSearch -Identity $Identity -Confirm:$false -ErrorAction Stop
+                    Write-Host "  Search stopped." -ForegroundColor Yellow
+                }
+                catch {
+                    Write-Host "  WARNING: could not stop the runaway search automatically - check its status manually: Get-ComplianceSearch -Identity '$Identity'. Details: $_" -ForegroundColor Red
+                }
+                Write-Error "Search '$Identity' aborted: matched $($search.Items) items while still $status, which is almost certainly a query that lost its filter (e.g. an unindexed clause silently dropped) rather than a genuine result set for a single-incident search. Review the KQL query before retrying - do not simply re-run with a longer timeout."
             }
 
+            Write-Host "  Searching... Status: $status, Items found so far: $($search.Items)" -ForegroundColor Yellow
             Start-Sleep -Seconds $checkInterval
             $elapsed += $checkInterval
         }
@@ -795,6 +1000,12 @@ function Invoke-EmailSearchAndDelete {
     )
 
     $SearchName = "ComplianceSearch_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+    # Guards the catch-block cleanup below - without this, a failure that happens
+    # BEFORE New-ComplianceSearch ever runs (e.g. Message-ID resolution failing)
+    # still triggers a Remove-ComplianceSearch attempt against a search that was
+    # never created, producing a confusing secondary ManagementObjectNotFoundException
+    # that buries the real error in the log.
+    $searchCreated = $false
 
     try {
         # 1. Collect search criteria (interactively if none were supplied on the command line,
@@ -886,6 +1097,7 @@ function Invoke-EmailSearchAndDelete {
             # 3. Create compliance search
             Write-Host "`n[Step 3] Creating compliance search '$SearchName'..."
             $search = New-ComplianceSearch -Name $SearchName -ExchangeLocation All -ContentMatchQuery $kqlQuery
+            $searchCreated = $true
             Write-Host "Compliance search created."
             Start-Sleep -Seconds $CmdDelaySeconds
 
@@ -894,7 +1106,7 @@ function Invoke-EmailSearchAndDelete {
             Start-ComplianceSearch -Identity $SearchName
             Start-Sleep -Seconds $CmdDelaySeconds
 
-            $searchResult = Wait-ComplianceSearch -Identity $SearchName -TimeoutSeconds ($QueryTimeoutMinutes * 60) -RunawayItemCeiling $RunawaySearchItemCeiling
+            $searchResult = Wait-ComplianceSearch -Identity $SearchName -TimeoutSeconds ($QueryTimeoutMinutes * 60)
             $itemsFound = $searchResult.Items
 
             if ($itemsFound -eq 0) {
@@ -1102,19 +1314,8 @@ function Invoke-EmailSearchAndDelete {
         Write-Host "======================================" -ForegroundColor Green
     }
     catch {
-        if ($SearchMode -eq 'Modern') {
-            # Best-effort cleanup after a failed/aborted search. Stop first, in case it's
-            # still actively running (e.g. the runaway-item abort above) - Remove-ComplianceSearch
-            # isn't guaranteed to tear down a search that's still InProgress. Report whether
-            # this actually worked instead of swallowing the result either way.
-            try { Stop-ComplianceSearch -Identity $SearchName -Confirm:$false -ErrorAction SilentlyContinue } catch { }
-            try {
-                Remove-ComplianceSearch -Identity $SearchName -Confirm:$false -ErrorAction Stop
-                Write-Host "Cleaned up compliance search '$SearchName' after the error above." -ForegroundColor Yellow
-            }
-            catch {
-                Write-Host "WARNING: could not automatically clean up compliance search '$SearchName' after the error above. Check its status manually: Get-ComplianceSearch -Identity '$SearchName'" -ForegroundColor Red
-            }
+        if ($SearchMode -eq 'Modern' -and $searchCreated) {
+            Remove-ComplianceSearchWithReport -Identity $SearchName
         }
         throw
     }
@@ -1144,6 +1345,10 @@ try {
     if ($SearchOnly) { Write-Host "MODE: SEARCH ONLY - no delete action will run" -ForegroundColor Green }
     Write-Host "======================================" -ForegroundColor Cyan
 
+    if ($CheckForUpdates) {
+        Test-ScriptVersionCurrent -CurrentVersion $ScriptVersion -Url $UpdateCheckUrl -TimeoutSeconds $UpdateCheckTimeoutSeconds
+    }
+
     # 0. Connect and authenticate
     Write-Host "`n[Step 0] Connecting to Exchange..."
     $connection = Connect-ExchangeSession -Server $Server -Credential $Credential -UseSSL:$UseSSL
@@ -1160,6 +1365,15 @@ try {
     # 0c. Confirm the connecting account can actually do what's being asked
     Write-Host "`n[Step 0c] Checking permissions..."
     Test-RequiredPermissions -Mode $SearchMode -Credential $Credential -DeleteRequested:(-not $SearchOnly)
+
+    # 0d. Flag a known correlate of "Failed to retrieve executing user" (on-prem
+    # only - see the long comment on Test-ExecutingUserMailbox for the full
+    # incident history behind this check).
+    Write-Host "`n[Step 0d] Checking executing account mailbox status..."
+    $accountNameForMailboxCheck = $Credential.UserName
+    if ($accountNameForMailboxCheck -match '\\(.+)$') { $accountNameForMailboxCheck = $Matches[1] }
+    elseif ($accountNameForMailboxCheck -match '^(.+)@') { $accountNameForMailboxCheck = $Matches[1] }
+    Test-ExecutingUserMailbox -AccountName $accountNameForMailboxCheck -IsEXO:$IsEXO
 
     # 1+. Run a search, then offer to run another with the same session (no re-auth needed).
     # CLI-bound criteria (-MessageID/-SenderEmail/etc.) only ever apply to this first run;
